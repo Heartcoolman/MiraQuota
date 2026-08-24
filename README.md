@@ -50,6 +50,9 @@ Fable 5   首 ≈6.1s · 48 tok/s 慢37%  74 分钟前
 | 客户端内控件（可选） | Mirasim 需带 `--remote-debugging-port` 启动，见「放进 Mirasim 界面」；不带则只显示菜单栏图标 |
 | 美元口径 | 由本机账本折算，账本取自 `~/.claude/projects/*/*.jsonl`（Claude Code）与 `~/.mirasim/insights/usage-*.ndjson`（Mirasim 网关）。两处均为空时点数与百分比照常显示，美元金额与额度点单价不出 |
 
+不提供预编译包：未经开发者签名的下载包会被 Gatekeeper 隔离，需手工去除隔离属性才能运行；
+本地构建时 `bundle.sh` 做 ad-hoc 签名，不受此限。故安装路径只有一条——克隆后自行构建。
+
 未适配 Windows 与 Linux：菜单栏、LaunchAgent、CDP 注入的落位逻辑均依赖 macOS。
 Windows 上可参考 [chiakinanam1/mirasim-quota-widget](https://github.com/chiakinanam1/mirasim-quota-widget)，
 它走的是注入 payload 目录 index.html 那条路。
