@@ -1,13 +1,20 @@
 # MiraQuota
 
-macOS 菜单栏常驻插件，把 Mirasim 的 5 小时 / 7 天额度百分比换算成美元口径：满额大约值多少，当前窗口已经用掉多少。
+**长在 Mirasim 客户端界面里的额度控件。** 把 5 小时 / 7 天额度换算成美元口径（满额大约值多少、
+当前窗口已经用掉多少），显示在 Mirasim 自己的标题栏上。控件经 CDP 注入渲染进程，
+**不改 Mirasim 的任何文件**，Mirasim 升级不失效。
 
-> An unofficial macOS menu-bar (and in-client) widget that turns Mirasim's 5-hour / 7-day quota
-> percentages into a dollar-denominated view. macOS 14+, built from source with a full Xcode.
+注入不可用时（Mirasim 未带调试端口启动）退回 macOS 菜单栏显示同一份数据；控件活着时菜单栏图标自动收起。
+菜单栏是兜底显示面，不是主形态。
+
+> An unofficial widget injected into the Mirasim desktop client's own UI via CDP — no file of
+> Mirasim is modified — turning its 5-hour / 7-day quota into a dollar-denominated view.
+> The widget and its data contract are platform-neutral; the provider process that feeds it is
+> currently implemented for macOS only. See `docs/ARCHITECTURE.md` for what a port needs.
 > Not affiliated with Mirasim or Anthropic. Documentation below is in Chinese.
 
 ```
-菜单栏    24.3% · $54.6
+Mirasim 标题栏   ● 5h 24.3% $54.6 · 7d 23.5%      注入的胶囊，点开即下面这层
 
 额度                                    精确
 
@@ -44,18 +51,24 @@ Fable 5   首 ≈6.1s · 48 tok/s 慢37%  74 分钟前
 
 | 项 | 要求 |
 |---|---|
-| 系统 | macOS 14 或更新；Apple Silicon 与 Intel 均可（在本机构建本机架构） |
+| 控件所需 | Mirasim 桌面版在本机运行，且以 `--remote-debugging-port` 启动（用 `scripts/mirasim-debug.sh`，或 `install.sh` 生成的启动器）。不带该参数控件不出现，只剩菜单栏兜底 |
+| Mirasim 版本 | `/v1/limits` 于 v0.0.220 实测可用；旧版没有该端点时自动退回 relay 帧的百分比口径 |
+| 系统 | 当前的 provider 实现要求 macOS 14 或更新（Apple Silicon 与 Intel 均可，在本机构建本机架构）。控件与数据契约本身不依赖平台，见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | 构建 | 完整 Xcode 16 或更新（Swift 6 工具链）。仅装 Command Line Tools 编不过，SwiftUI 的宏插件不在其中。`bundle.sh` 依次探 `DEVELOPER_DIR`、`xcode-select -p`、`/Applications/Xcode*.app`，找不到完整 Xcode 即报错退出 |
-| Mirasim | 桌面版在本机运行。`/v1/limits` 于 v0.0.220 实测可用；旧版没有该端点时自动退回 relay 帧的百分比口径 |
-| 客户端内控件（可选） | Mirasim 需带 `--remote-debugging-port` 启动，见「放进 Mirasim 界面」；不带则只显示菜单栏图标 |
 | 美元口径 | 由本机账本折算，账本取自 `~/.claude/projects/*/*.jsonl`（Claude Code）与 `~/.mirasim/insights/usage-*.ndjson`（Mirasim 网关）。两处均为空时点数与百分比照常显示，美元金额与额度点单价不出 |
 
 不提供预编译包：未经开发者签名的下载包会被 Gatekeeper 隔离，需手工去除隔离属性才能运行；
 本地构建时 `bundle.sh` 做 ad-hoc 签名，不受此限。故安装路径只有一条——克隆后自行构建。
 
-未适配 Windows 与 Linux：菜单栏、LaunchAgent、CDP 注入的落位逻辑均依赖 macOS。
-Windows 上可参考 [chiakinanam1/mirasim-quota-widget](https://github.com/chiakinanam1/mirasim-quota-widget)，
-它走的是注入 payload 目录 index.html 那条路。
+**哪部分与 macOS 绑定**：控件（`widget/miraquota-widget.js`，Shadow DOM、纯 JS、无外部依赖）
+与它同数据侧的契约（回环 HTTP 上的 `quota.json`）都不依赖平台；绑定 macOS 的是喂数据的常驻进程，具体是三处：
+兜底的菜单栏界面（AppKit/SwiftUI）、LaunchAgent 自启、端口发现用的 `ps` 与 `lsof`。
+在 Windows / Linux 上复用，按 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 的契约另写一个 provider 即可，
+控件与注入流程可原样搬。
+
+Windows 上另有一条不同的路子：[chiakinanam1/mirasim-quota-widget](https://github.com/chiakinanam1/mirasim-quota-widget)
+注入 payload 目录的 `index.html`。该路子在本机无效——Mirasim 主进程加载的是应用包里的 `app.asar`，
+`~/.mirasim/app/<版本>` 那套 payload 没被加载。
 
 ## 边界与免责
 
@@ -98,6 +111,62 @@ launchctl kickstart -k gui/$(id -u)/local.miraquota
 同理，`launchctl bootout` 是异步的，未等作业拆除完就 `bootstrap` 会以
 `EIO` 失败。**不要回退到 legacy 的 `launchctl load`**——那样加载的 agent 进程能跑，
 但同样拿不到菜单栏位置，表现为「装好了却没图标」。
+
+## 放进 Mirasim 界面
+
+这是本项目的主形态。控件与数据侧之间的两份契约（回环 HTTP 上的 `quota.json`、CDP 注入流程）
+写在 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，换平台重写 provider 时照它实现即可。
+
+控件长在 Mirasim 的界面里，不改 Mirasim 的任何文件：
+
+```bash
+./scripts/mirasim-debug.sh          # 退出并以 --remote-debugging-port=9333 重开 Mirasim
+```
+
+之后 MiraQuota 每 10 秒巡检一次 CDP 端点（稳定后退避到 30 秒），把
+`Contents/Resources/widget.js` 送进渲染进程（`Page.addScriptToEvaluateOnNewDocument`
+覆盖此后每次导航，`Runtime.evaluate` 补上当前这次），控件出现在界面右上角。
+
+控件的交互：拖动移位（松手时才落盘，位置夹在视口内）、**拖到标题栏空位即吸附**、点胶囊或按 Esc 开合、
+展开层在下方装不下时翻到上方、层内文字可选中复制、「退出」需点两次确认。
+吸附位取「标题栏上不与宿主控件重叠的最右一段空位」：Mirasim 自己的标题栏右侧排着波形、
+`29% 云端`、分支、复制等控件，控件贴右上角会压在上面。落位靠命中测试在标题栏带上从右往左扫，
+遇到第一段能放下胶囊的空白即停（实测本机空白段为 x 415–875，胶囊落在 695–877，与宿主控件留 8px）。
+竖向位置按**宿主底色的连续段**居中，不按 header 元素高度：Mirasim 的 header 是 28px，其下还有约
+6px 同色区域，眼睛看到的是一整条约 34px 的深色带，按 28 居中会贴着窗口上沿（上 3px、下 9px）。
+落位时自顶向下逐像素比对生效背景色，取相同底色的连续段作为带高，胶囊在带内居中。
+判定命中的条件是「竖向贴着标题栏（±16px）」且「横向在吸附位左右 140px 内，或该落位会压住宿主控件」——
+压住宿主控件的位置本来就不该停。吸附后只存一个标志，坐标每轮重算，故窗口缩放、标签增减、
+宿主控件出现或收起时控件跟着走；拖离即解除，之后按存下的坐标落位。
+
+主题按 `data-theme` → 宿主背景亮度 → 系统偏好三级判定（本机系统为浅色而 Mirasim 界面为深色，
+只看系统偏好会把浅色控件贴到深色界面上）。系统开启「减弱动态效果」时所有过渡与脉冲关闭。
+骨架只建一次、更新只改文本与宽度，故进度条的宽度过渡真正生效，hover 与选区也不会每秒被清掉。
+
+**客户端里有控件时菜单栏图标自动收起**，注入不可用（Mirasim 未带调试端口启动）时再放出来，
+任何时候都至少有一处能看到额度。
+
+数据不走文件：菜单栏进程在 `http://127.0.0.1:4988/quota.json` 上挂一份算好的 JSON
+（4988 被占时向后顺延到 4995；只绑回环，只读），控件用 `fetch` 每 5 秒取一次。
+控件失联时会在该区间内自行重找端口，持久注入脚本里烤着的旧端口不会造成失联。
+另有 `POST /quit`，须带 `X-MiraQuota-Token` 头（令牌在 `~/.miraquota/feed.token`，
+0600，首启生成）：回环端口上任何网页都能发出请求，GET 或裸 POST 会被浏览器
+不经预检直接送达，无令牌校验时任意被访问的网页都能把本应用关掉。
+渲染进程读不到 `~/.claude/projects` 与网关账本，美元与速度只能这样喂过去。
+
+为什么走 CDP 而不是改文件：
+
+| 路子 | 结论 |
+|---|---|
+| 注入 `~/.mirasim/app/<版本>/{renderer,web}/index.html` | 本机跑的是应用包里的版本（主进程打开的是 `app.asar`），payload 目录里的 0.0.151 没被加载，注入无效 |
+| 改 `app.asar` | Electron fuse `EnableEmbeddedAsarIntegrityValidation` 是关闭的，改包不会被校验拦下，但会破坏应用签名，且每次更新被覆盖 |
+| CDP 注入 | 不碰 Mirasim 的文件，升级不失效；代价是启动参数要带调试端口 |
+
+渲染进程的 CSP 是 `script-src 'self'`，普通 script 标签加载不了外部脚本；CDP 执行的代码不受
+CSP 约束，而 `connect-src` 明确放行 `http://127.0.0.1:*` 与 `ws://127.0.0.1:*`，故控件能回来取数。
+
+**代价要说清**：调试端口开着时，本机任何进程都能在 Mirasim 的渲染进程里执行 JS。端口只绑回环，
+但这确实降低了该应用的隔离度。不想要就别跑那个脚本——控件不出现，菜单栏图标照常显示。
 
 ## 数据来源
 
@@ -224,59 +293,6 @@ relay 实测值。修正后 $20.21 / $206 = 9.8%，与同刻实测的 9.8% 相�
 - **对照**：提示浮层里附上 Mirasim 自己测的 `turn.finish.ttfbMs` 中位数。它是整轮首字节而非单次请求，且只覆盖图形界面发起的对话（两天共 7 条），只能作量级对照。
 
 出字速度不含首字等待，故高于端到端速率。两者与首 token 自洽：`首 token + 输出量 ÷ 出字速度` 应接近观测到的时长中位数（实测 4.5 + 460/81 ≈ 10.2s，观测中位 9.7s）。
-
-## 放进 Mirasim 界面
-
-控件长在 Mirasim 的界面里，不改 Mirasim 的任何文件：
-
-```bash
-./scripts/mirasim-debug.sh          # 退出并以 --remote-debugging-port=9333 重开 Mirasim
-```
-
-之后 MiraQuota 每 10 秒巡检一次 CDP 端点（稳定后退避到 30 秒），把
-`Contents/Resources/widget.js` 送进渲染进程（`Page.addScriptToEvaluateOnNewDocument`
-覆盖此后每次导航，`Runtime.evaluate` 补上当前这次），控件出现在界面右上角。
-
-控件的交互：拖动移位（松手时才落盘，位置夹在视口内）、**拖到标题栏空位即吸附**、点胶囊或按 Esc 开合、
-展开层在下方装不下时翻到上方、层内文字可选中复制、「退出」需点两次确认。
-吸附位取「标题栏上不与宿主控件重叠的最右一段空位」：Mirasim 自己的标题栏右侧排着波形、
-`29% 云端`、分支、复制等控件，控件贴右上角会压在上面。落位靠命中测试在标题栏带上从右往左扫，
-遇到第一段能放下胶囊的空白即停（实测本机空白段为 x 415–875，胶囊落在 695–877，与宿主控件留 8px）。
-竖向位置按**宿主底色的连续段**居中，不按 header 元素高度：Mirasim 的 header 是 28px，其下还有约
-6px 同色区域，眼睛看到的是一整条约 34px 的深色带，按 28 居中会贴着窗口上沿（上 3px、下 9px）。
-落位时自顶向下逐像素比对生效背景色，取相同底色的连续段作为带高，胶囊在带内居中。
-判定命中的条件是「竖向贴着标题栏（±16px）」且「横向在吸附位左右 140px 内，或该落位会压住宿主控件」——
-压住宿主控件的位置本来就不该停。吸附后只存一个标志，坐标每轮重算，故窗口缩放、标签增减、
-宿主控件出现或收起时控件跟着走；拖离即解除，之后按存下的坐标落位。
-
-主题按 `data-theme` → 宿主背景亮度 → 系统偏好三级判定（本机系统为浅色而 Mirasim 界面为深色，
-只看系统偏好会把浅色控件贴到深色界面上）。系统开启「减弱动态效果」时所有过渡与脉冲关闭。
-骨架只建一次、更新只改文本与宽度，故进度条的宽度过渡真正生效，hover 与选区也不会每秒被清掉。
-
-**客户端里有控件时菜单栏图标自动收起**，注入不可用（Mirasim 未带调试端口启动）时再放出来，
-任何时候都至少有一处能看到额度。
-
-数据不走文件：菜单栏进程在 `http://127.0.0.1:4988/quota.json` 上挂一份算好的 JSON
-（4988 被占时向后顺延到 4995；只绑回环，只读），控件用 `fetch` 每 5 秒取一次。
-控件失联时会在该区间内自行重找端口，持久注入脚本里烤着的旧端口不会造成失联。
-另有 `POST /quit`，须带 `X-MiraQuota-Token` 头（令牌在 `~/.miraquota/feed.token`，
-0600，首启生成）：回环端口上任何网页都能发出请求，GET 或裸 POST 会被浏览器
-不经预检直接送达，无令牌校验时任意被访问的网页都能把本应用关掉。
-渲染进程读不到 `~/.claude/projects` 与网关账本，美元与速度只能这样喂过去。
-
-为什么走 CDP 而不是改文件：
-
-| 路子 | 结论 |
-|---|---|
-| 注入 `~/.mirasim/app/<版本>/{renderer,web}/index.html` | 本机跑的是应用包里的版本（主进程打开的是 `app.asar`），payload 目录里的 0.0.151 没被加载，注入无效 |
-| 改 `app.asar` | Electron fuse `EnableEmbeddedAsarIntegrityValidation` 是关闭的，改包不会被校验拦下，但会破坏应用签名，且每次更新被覆盖 |
-| CDP 注入 | 不碰 Mirasim 的文件，升级不失效；代价是启动参数要带调试端口 |
-
-渲染进程的 CSP 是 `script-src 'self'`，普通 script 标签加载不了外部脚本；CDP 执行的代码不受
-CSP 约束，而 `connect-src` 明确放行 `http://127.0.0.1:*` 与 `ws://127.0.0.1:*`，故控件能回来取数。
-
-**代价要说清**：调试端口开着时，本机任何进程都能在 Mirasim 的渲染进程里执行 JS。端口只绑回环，
-但这确实降低了该应用的隔离度。不想要就别跑那个脚本——控件不出现，菜单栏图标照常显示。
 
 ## 读不到时怎么办
 
