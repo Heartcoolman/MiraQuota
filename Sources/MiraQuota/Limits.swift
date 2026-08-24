@@ -1,0 +1,217 @@
+import Foundation
+
+/// 额度的原始值：已用与总额，单位是 Mirasim 自己的额度点。
+struct LimitsSnapshot: Sendable {
+    struct Window: Sendable {
+        let label: String
+        let used: Double
+        let budget: Double
+        let resetAt: Date
+
+        var usedPercent: Double { budget > 0 ? min(100, used / budget * 100) : 0 }
+        var quotaWindow: QuotaWindow { QuotaWindow(label: label, usedPercent: usedPercent, resetAt: resetAt) }
+    }
+
+    let windows: [Window]
+    let capturedAt: Date
+    let suspended: Bool
+    let unmetered: Bool
+    let degraded: Bool
+
+    func window(_ label: String) -> Window? {
+        windows.first { $0.label.caseInsensitiveCompare(label) == .orderedSame }
+    }
+
+    /// 账号状态异常时的一句话说明，正常则为 nil。
+    var notice: String? {
+        if suspended { return "账号被暂停，额度数字仅供参考" }
+        if unmetered { return "账号不计量，额度上限不适用" }
+        if degraded { return "上游降级运行中" }
+        return nil
+    }
+}
+
+/// `/v1/limits` 客户端。
+///
+/// Mirasim 分给每个会话的回环端口（Claude Code 的 `ANTHROPIC_BASE_URL`）上挂着一个路由，
+/// `GET /v1/limits` 对本机免认证放行，回传 `windows[].{name, used, budget, reset_at}`。
+/// `used` 带小数位，优于 relay 帧的 0.1% 分辨率；`reset_at` 与帧一致。
+/// 端点未公开（v0.0.220 实测可用），故只当主源用，取不到就退回 relay 帧。
+final class LimitsClient {
+    /// 两次取值之间的最小间隔。心跳与帧事件都会触发重建，不必每次都问一遍。
+    private static let minInterval: TimeInterval = 15
+    /// 端口枚举全军覆没后的静默期。旧版 Mirasim 没有这个端点，不必每 15 秒重扫一遍。
+    private static let rediscoverAfter: TimeInterval = 300
+
+    private let lock = NSLock()
+    private var cachedPort: Int?
+    private var last: LimitsSnapshot?
+    private var lastAttempt = Date.distantPast
+    private var discoveryFailedAt = Date.distantPast
+
+    /// 取当前额度。`anchorPort` 是已连上的 mirachannel 端口，探测只在同一进程持有的
+    /// 端口上进行，避免读到另一个 Mirasim 实例（可能是另一个账号）的额度。
+    /// 未到间隔时返回上一次的结果，取不到返回 nil。
+    func snapshot(now: Date = Date(), anchorPort: Int? = nil) -> LimitsSnapshot? {
+        lock.lock()
+        if now.timeIntervalSince(lastAttempt) < Self.minInterval, let last {
+            lock.unlock()
+            return last
+        }
+        lastAttempt = now
+        let port = cachedPort
+        let quietUntil = discoveryFailedAt.addingTimeInterval(Self.rediscoverAfter)
+        lock.unlock()
+
+        if Diag.forceOffline || Diag.noLimits { return nil }
+
+        var found = port.flatMap { Self.fetch(port: $0) }
+        if found == nil, now.timeIntervalSince(quietUntil) >= 0 {
+            let candidates = Self.routerPorts(anchor: anchorPort)
+            for candidate in candidates where candidate != port {
+                if let s = Self.fetch(port: candidate) {
+                    found = s
+                    lock.lock(); cachedPort = candidate; lock.unlock()
+                    break
+                }
+            }
+            // 只有「端口在、但都没有这个端点」才进静默期——那是旧版 Mirasim 的表现。
+            // 一个端口都没枚举到只说明 Mirasim 正在起或刚重启，下一轮就该再试，
+            // 否则重启后要干等五分钟才恢复精确口径。
+            if found == nil, !candidates.isEmpty {
+                lock.lock(); discoveryFailedAt = now; lock.unlock()
+            }
+        }
+
+        lock.lock()
+        if found == nil { cachedPort = nil }
+        last = found
+        lock.unlock()
+        return found
+    }
+
+    /// Mirasim 重连后调用：清掉缓存端口与静默期，立刻重新枚举。
+    /// 重启会换掉全部会话端口，旧缓存必然失效。
+    func invalidate() {
+        lock.lock()
+        cachedPort = nil
+        last = nil
+        discoveryFailedAt = .distantPast
+        lastAttempt = .distantPast
+        lock.unlock()
+    }
+
+    /// 已确认可用的路由端口，供自检显示。
+    var port: Int? {
+        lock.lock(); defer { lock.unlock() }
+        return cachedPort
+    }
+
+    // MARK: 取值
+
+    private static func fetch(port: Int) -> LimitsSnapshot? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/limits") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        var payload: Data?
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            if (response as? HTTPURLResponse)?.statusCode == 200 { payload = data }
+            done.signal()
+        }.resume()
+        _ = done.wait(timeout: .now() + 3)
+        guard let payload else { return nil }
+        return parse(payload)
+    }
+
+    static func parse(_ data: Data) -> LimitsSnapshot? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = root["windows"] as? [[String: Any]] else { return nil }
+        let now = Date().timeIntervalSince1970
+        let windows: [LimitsSnapshot.Window] = raw.compactMap { w in
+            guard let name = w["name"] as? String,
+                  let used = number(w["used"]), let budget = number(w["budget"]), budget > 0,
+                  var reset = number(w["reset_at"]) else { return nil }
+            // 端点未公开，单位可能改毫秒（帧解析同款归一化）。归一化后仍不在
+            // 合理区间的窗口丢弃：重置时刻落在将来数万年会让窗口起点跑到将来，
+            // 已用金额静默显示 $0 且不触发任何降级。
+            if reset > 1e11 { reset /= 1000 }
+            guard reset > now - 86400, reset < now + 30 * 86400 else { return nil }
+            return LimitsSnapshot.Window(label: name, used: used, budget: budget,
+                                         resetAt: Date(timeIntervalSince1970: reset))
+        }
+        guard !windows.isEmpty else { return nil }
+        return LimitsSnapshot(windows: windows, capturedAt: Date(),
+                              suspended: root["suspended"] as? Bool ?? false,
+                              unmetered: root["unmetered"] as? Bool ?? false,
+                              degraded: root["degraded"] as? Bool ?? false)
+    }
+
+    private static func number(_ v: Any?) -> Double? {
+        if let d = v as? Double { return d }
+        if let i = v as? Int { return Double(i) }
+        if let s = v as? String { return Double(s) }
+        return nil
+    }
+
+    // MARK: 端口发现
+
+    /// Mirasim 进程持有的回环监听端口。会话进出会增减端口，故每次失败后重新枚举。
+    /// 给了 `anchor` 就只取持有该端口的那个进程，避免读到并行开发实例的额度。
+    ///
+    /// `lsof` 必须用 `-p` 限定进程：`lsof -iTCP:<port>` 不带 `-p` 会全系统扫描，
+    /// 实测会把调用线程卡住上百秒。故先用 `ps` 拿到候选进程，再一次 `lsof` 取端口。
+    static func routerPorts(anchor: Int? = nil) -> [Int] {
+        let pids = mirasimPIDs()
+        guard !pids.isEmpty else { return [] }
+        let args = ["-nP", "-w", "-iTCP", "-sTCP:LISTEN", "-a",
+                    "-p", pids.map(String.init).joined(separator: ","), "-Fpn"]
+        guard let text = run("/usr/sbin/lsof", args) else { return [] }
+
+        var byPID: [Int: [Int]] = [:]
+        var current: Int?
+        for line in text.split(separator: "\n") {
+            if line.hasPrefix("p") {
+                current = Int(line.dropFirst())
+            } else if line.hasPrefix("n127.0.0.1:"), let pid = current,
+                      let port = Int(line.dropFirst("n127.0.0.1:".count)) {
+                byPID[pid, default: []].append(port)
+            }
+        }
+
+        let ports: [Int]
+        if let anchor {
+            // 限定同一进程是同账号保证的全部意义：锚点端口找不到归属时退回
+            // 全实例扫描，恰好在并行开发实例的场景里读到别的账号。找不到就空手而归，
+            // 额度退回 relay 帧口径（帧本就来自锚点那个实例）。
+            ports = byPID.first(where: { $0.value.contains(anchor) })?.value ?? []
+        } else {
+            ports = byPID.values.flatMap { $0 }
+        }
+        // mirachannel 那个端口回的是首页 HTML，放到最后再试。
+        return Array(Set(ports)).sorted { a, b in (a == 4970 ? 1 : 0) < (b == 4970 ? 1 : 0) }
+    }
+
+    private static func mirasimPIDs() -> [Int] {
+        guard let text = run("/bin/ps", ["-axo", "pid=,command="]) else { return [] }
+        var pids: [Int] = []
+        for line in text.split(separator: "\n") where line.contains("server.cjs") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let pid = Int(trimmed.prefix(while: { $0.isNumber })) { pids.append(pid) }
+        }
+        return pids
+    }
+
+    private static func run(_ path: String, _ args: [String]) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    }
+}
