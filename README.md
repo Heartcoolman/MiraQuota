@@ -1,51 +1,81 @@
-# MiraQuota
+<h1 align="center">MiraQuota</h1>
 
-**长在 Mirasim 客户端界面里的额度控件。** 把 5 小时 / 7 天额度换算成美元口径（满额大约值多少、
-当前窗口已经用掉多少），显示在 Mirasim 自己的标题栏上。控件经 CDP 注入渲染进程，
-**不改 Mirasim 的任何文件**，Mirasim 升级不失效。
+<p align="center">
+长在 <b>Mirasim 客户端界面里</b>的额度控件：把 5 小时 / 7 天额度换算成美元口径，<br>
+经 CDP 注入渲染进程，<b>不改 Mirasim 的任何文件</b>，升级不失效。
+</p>
 
-注入不可用时（Mirasim 未带调试端口启动）退回 macOS 菜单栏显示同一份数据；控件活着时菜单栏图标自动收起。
-菜单栏是兜底显示面，不是主形态。
+<p align="center">
+<img src="https://img.shields.io/badge/macOS-14%2B-1c1c1e" alt="macOS 14+">
+<img src="https://img.shields.io/badge/Swift-6-f05138" alt="Swift 6">
+<img src="https://img.shields.io/badge/portable%20provider-Node%2022%2B-5fa04e" alt="Node 22+">
+<img src="https://img.shields.io/badge/host%20files-untouched-2ea043" alt="host files untouched">
+<img src="https://img.shields.io/badge/license-MIT-0969da" alt="MIT">
+</p>
+
+<p align="center">
+<img src="docs/images/widget-titlebar.png" width="820" alt="Mirasim 标题栏上的额度胶囊">
+</p>
+
+<p align="center">
+<sub>真实界面截图。胶囊落在 Mirasim 标题栏最右一段空位上，右侧三个控件是 Mirasim 自带的；<br>
+落位由命中测试算出，不写死坐标，窗口缩放与宿主布局变化后自动跟随。</sub>
+</p>
+
+<table>
+<tr>
+<td width="45%" valign="top">
+<img src="docs/images/widget-panel.png" alt="展开后的额度卡与速度卡">
+</td>
+<td valign="top">
+
+点胶囊展开，每个额度窗口一张卡。主行金额、进度条与百分比同分母，三者互相自洽。
+
+<ul>
+<li><b>$13.9 / $244</b>：按点数口径折算的已用额度与该窗口满额（<code>满额 × 用量百分比</code>）</li>
+<li><b>进度条上的竖线</b>：均速游标，用量条越过它表示消耗快于线性速度</li>
+<li><b>账本 $30.9 · 8922/157k 点</b>：副行的另一口径，本机账本支出与原始额度点</li>
+<li><b>≈2.9 天后打满</b>：按当前速度外推；到重置仍不满则写「到重置不满」</li>
+<li><b>速度卡</b>：出字速度与首 token 的回归估计，有请求在途时标「生成中」</li>
+<li><b>右上角的「精确」</b>：当前通道级别，共五级（精确 / 实时 / 已过期 / 推算 / 本地）</li>
+<li><b>底部两行</b>：满额的取得方式、额度点单价、账本桶数与 relay 线路状态</li>
+</ul>
+
+注入不可用时（Mirasim 未带调试端口启动）退回 macOS 菜单栏显示同一份数据，
+控件活着时菜单栏图标自动收起。菜单栏是兜底显示面，不是主形态。
+
+</td>
+</tr>
+</table>
+
+主行与副行可差到 1.9 倍（实测 $54.6 对 $104）。差值来自各窗口点数计价不同且随用量构成漂移，
+故账本值保留而不是弃用，两者并列在同一张卡上。
 
 > An unofficial widget injected into the Mirasim desktop client's own UI via CDP — no file of
 > Mirasim is modified — turning its 5-hour / 7-day quota into a dollar-denominated view.
 > The widget and its data contract are platform-neutral; the provider process that feeds it is
-> currently implemented for macOS only. See `docs/ARCHITECTURE.md` for what a port needs.
+> implemented for macOS (full) and Node (portable subset).
 > Not affiliated with Mirasim or Anthropic. Documentation below is in Chinese.
 
-```
-Mirasim 标题栏   ● 5h 24.3% $54.6 · 7d 23.5%      注入的胶囊，点开即下面这层
+## 快速开始
 
-额度                                    精确
+```bash
+git clone https://github.com/Heartcoolman/MiraQuota.git && cd MiraQuota
 
-5 小时          $54.6 / $224            24.3%
-████████▎──────────────────────────────────┃
-余 $170                        重置 0:35:29
-账本 $104 · 38.1k/157k 点
+./scripts/install.sh                        # macOS：构建、装到 ~/Applications、注册登录自启
+node provider-node/miraquota-provider.mjs   # Windows / Linux：跨平台参考 provider
 
-7 天             $522 / ~$2,222          23.5%
-████████▎────┃─────────────────────────────
-余 ~$1,700 · ≈1.1 天后打满        重置 6 天
-账本 $504 · 132k/560k 点
-
-7 天 · Fable    $61.9 / ~$1,137           5.4%
-██▏──┃─────────────────────────────────────
-余 ~$1,075                        重置 6 天
-账本 $504 · 16.2k/297k 点
-
-速度                    ● 生成中 2 条 · 已 19 秒
-Opus 5    首 ≈4.0s · 80 tok/s        52 秒前
-Fable 5   首 ≈6.1s · 48 tok/s 慢37%  74 分钟前
-
-满额 回归标定优先 · 兜底 额度点 × $0.003804
-999 分钟桶 · models.dev cache · cloud relay.mirasim.ai · ok
+./scripts/mirasim-debug.sh                  # 让 Mirasim 带调试端口重启，控件随即出现
 ```
 
-进度条上的竖线是均速游标。用量条越过它表示消耗快于线性速度。
+## 目录
 
-**卡面主行是按点数口径折算的已用额度**（`满额 × 用量百分比`），与百分比、进度条同分母，
-三者互相自洽；本机账本支出放在副行的「账本 $x」。两者的差值反映当前窗口的用量构成与
-标定期不同（各窗口点数计价不同，实测 5h 上可差到 1.8 倍），故账本值保留而不是弃用。
+[前置条件](#前置条件) · [边界与免责](#边界与免责) · [安装](#安装) · [放进 Mirasim 界面](#放进-mirasim-界面) ·
+[数据来源](#数据来源) · [满额怎么来](#满额怎么来) · [出字速度与首 token 怎么来](#出字速度与首-token-怎么来) ·
+[读不到时怎么办](#读不到时怎么办) · [排查](#排查) · [已知限制](#已知限制) ·
+[常驻开销](#常驻开销) · [状态文件](#状态文件)
+
+旁支文档：[架构与移植契约](docs/ARCHITECTURE.md) · [跨平台参考 provider](provider-node/) · [0.2 规划记录](docs/PLAN-0.2.md)
 
 ## 前置条件
 
@@ -87,8 +117,6 @@ Windows 上另有一条不同的路子：[chiakinanam1/mirasim-quota-widget](htt
 ## 安装
 
 ```bash
-git clone https://github.com/Heartcoolman/MiraQuota.git
-cd MiraQuota
 ./scripts/install.sh      # 构建、装到 ~/Applications 并注册 LaunchAgent
 ./scripts/uninstall.sh    # 卸载；加 --purge 一并删除标定数据
 ```
