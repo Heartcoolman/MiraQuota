@@ -21,7 +21,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 17;
+  const VERSION = 18;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -970,7 +970,15 @@
     if (d.unitPriceUSD) {
       setText(els.meta1, `满额 回归标定优先 · 兜底 额度点 × $${d.unitPriceUSD.toFixed(6)}`);
     }
-    setText(els.meta2, `${d.buckets} 分钟桶 · ${d.pricing} · ${d.mode} ${d.host} · ${d.relayStatus}`);
+    // 只有 windows / capturedAt / state / stateLabel 是必填字段（见 docs/ARCHITECTURE.md），
+    // 其余按有值的部分拼，缺项不显示——否则精简的 provider 会在这一行显示 undefined。
+    const meta = [];
+    if (d.buckets != null) meta.push(`${d.buckets} 分钟桶`);
+    if (d.pricing) meta.push(d.pricing);
+    if (d.mode || d.host) meta.push([d.mode, d.host].filter(Boolean).join(' '));
+    if (d.relayStatus) meta.push(d.relayStatus);
+    setHidden(els.meta2, !meta.length);
+    setText(els.meta2, meta.join(' · '));
     setTick(els.stamp, clock(d.capturedAt));
   }
 

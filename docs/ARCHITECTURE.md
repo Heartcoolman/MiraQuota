@@ -98,6 +98,9 @@ provider 侧要做到的六条，缺一条都有确定的故障形态：
 
 ## 移植清单
 
+仓库里的 [provider-node/miraquota-provider.mjs](../provider-node/miraquota-provider.mjs)
+已按下表实现了不依赖账本的那一半（三个平台的进程与端口枚举都在里面），可直接用或作起点。
+
 | 能力 | macOS 现在的做法 | 移植时 |
 |---|---|---|
 | CDP 探测与注入 | `URLSession` + `URLSessionWebSocketTask` | 任何 HTTP/WS 客户端。Node 22+ 自带 `WebSocket`，一个 `.mjs` 即可跑通 |

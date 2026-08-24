@@ -53,7 +53,7 @@ Fable 5   首 ≈6.1s · 48 tok/s 慢37%  74 分钟前
 |---|---|
 | 控件所需 | Mirasim 桌面版在本机运行，且以 `--remote-debugging-port` 启动（用 `scripts/mirasim-debug.sh`，或 `install.sh` 生成的启动器）。不带该参数控件不出现，只剩菜单栏兜底 |
 | Mirasim 版本 | `/v1/limits` 于 v0.0.220 实测可用；旧版没有该端点时自动退回 relay 帧的百分比口径 |
-| 系统 | 当前的 provider 实现要求 macOS 14 或更新（Apple Silicon 与 Intel 均可，在本机构建本机架构）。控件与数据契约本身不依赖平台，见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| 系统 | 完整版 provider 要求 macOS 14 或更新（Apple Silicon 与 Intel 均可，在本机构建本机架构）。Windows / Linux 用 [provider-node/](provider-node/)，只需 Node 22+，无需构建 |
 | 构建 | 完整 Xcode 16 或更新（Swift 6 工具链）。仅装 Command Line Tools 编不过，SwiftUI 的宏插件不在其中。`bundle.sh` 依次探 `DEVELOPER_DIR`、`xcode-select -p`、`/Applications/Xcode*.app`，找不到完整 Xcode 即报错退出 |
 | 美元口径 | 由本机账本折算，账本取自 `~/.claude/projects/*/*.jsonl`（Claude Code）与 `~/.mirasim/insights/usage-*.ndjson`（Mirasim 网关）。两处均为空时点数与百分比照常显示，美元金额与额度点单价不出 |
 
@@ -63,8 +63,10 @@ Fable 5   首 ≈6.1s · 48 tok/s 慢37%  74 分钟前
 **哪部分与 macOS 绑定**：控件（`widget/miraquota-widget.js`，Shadow DOM、纯 JS、无外部依赖）
 与它同数据侧的契约（回环 HTTP 上的 `quota.json`）都不依赖平台；绑定 macOS 的是喂数据的常驻进程，具体是三处：
 兜底的菜单栏界面（AppKit/SwiftUI）、LaunchAgent 自启、端口发现用的 `ps` 与 `lsof`。
-在 Windows / Linux 上复用，按 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 的契约另写一个 provider 即可，
-控件与注入流程可原样搬。
+在 Windows / Linux 上复用，用仓库里的跨平台参考实现
+[provider-node/](provider-node/)（单文件、Node 22+、无依赖）：它按同样的契约供数与注入，
+覆盖额度点、百分比、重置倒计时与均速游标，不含美元与速度卡（那部分要解析本机账本）。
+契约见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，控件与注入流程原样复用。
 
 Windows 上另有一条不同的路子：[chiakinanam1/mirasim-quota-widget](https://github.com/chiakinanam1/mirasim-quota-widget)
 注入 payload 目录的 `index.html`。该路子在本机无效——Mirasim 主进程加载的是应用包里的 `app.asar`，
