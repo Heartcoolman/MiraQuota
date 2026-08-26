@@ -219,15 +219,57 @@ enum Doctor {
             return
         }
         let desc = report.rows.map { row -> String in
-            let ttft = row.ttft.map { String(format: "首 ≈%.1fs", $0) } ?? "首 -"
+            let ttft = row.ttft.map { String(format: row.measured ? "首 %.1fs" : "首 ≈%.1fs", $0) } ?? "首 -"
             let rate = row.rate.map { String(format: "%.0f tok/s", $0) } ?? String(format: "端到端 %.0f tok/s", row.endToEnd)
             let drift = row.drift.map { String(format: " 较常态 %+.0f%%", $0) } ?? ""
             let age = Formatting.age(Date().timeIntervalSince(row.latestAt))
-            return "\(row.model) \(ttft) · \(rate) · 最近 \(row.samples) 次 · \(age)前\(drift)"
+            return "\(row.model)[\(row.measured ? "实测" : "回归")] \(ttft) · \(rate) · 最近 \(row.samples) 次 · \(age)前\(drift)"
         }.joined(separator: " · ")
         line(.ok, "速度样本", desc)
         if let m = report.measuredTurnTTFB {
             line(.ok, "实测对照", String(format: "Mirasim 整轮首字节 中位 %.1fs（%d 次，仅量级对照）", m.median, m.count))
+        }
+        checkMeasuredChannel()
+    }
+
+    /// 实测通道三个环节各自可断：env 没注入（新会话不发 trace）、
+    /// 接收端不在（常驻应用没跑）、样本没落盘（前两者之一断了或近期无请求）。
+    private static func checkMeasuredChannel() {
+        var envOK = false
+        if let data = try? Data(contentsOf: Paths.claudeSettings),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let env = root["env"] as? [String: Any] {
+            envOK = (env["OTEL_EXPORTER_OTLP_ENDPOINT"] as? String) == "http://127.0.0.1:\(OtlpReceiver.port)"
+                && (env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] as? String) != nil
+        }
+        if !envOK {
+            line(.warn, "实测通道", "~/.claude/settings.json 未注入 OTel env，新会话不上报逐请求实测",
+                 fix: "补齐 env：CLAUDE_CODE_ENABLE_TELEMETRY/ENHANCED_TELEMETRY_BETA=1、OTEL_TRACES_EXPORTER=otlp、http/json 指向 127.0.0.1:\(OtlpReceiver.port)")
+        }
+        if fetch("http://127.0.0.1:\(OtlpReceiver.port)/health") == nil {
+            line(.warn, "实测接收端", "127.0.0.1:\(OtlpReceiver.port) 无响应",
+                 fix: "接收端随常驻应用启动，检查 MiraQuota 是否在运行")
+        }
+        let fm = FileManager.default
+        let files = (try? fm.contentsOfDirectory(at: Paths.measuredDir, includingPropertiesForKeys: nil)) ?? []
+        var count = 0
+        var newest = 0
+        let cutoff = Int(Date().timeIntervalSince1970) - 48 * 3600
+        for f in files where f.lastPathComponent.hasPrefix("speed-") && f.pathExtension == "ndjson" {
+            guard let text = try? String(contentsOf: f, encoding: .utf8) else { continue }
+            for lineText in text.split(separator: "\n") {
+                guard let root = try? JSONSerialization.jsonObject(with: Data(lineText.utf8)) as? [String: Any],
+                      let at = root["at"] as? Int, at >= cutoff else { continue }
+                count += 1
+                newest = max(newest, at)
+            }
+        }
+        if count > 0 {
+            let age = Formatting.age(Date().timeIntervalSince1970 - Double(newest))
+            line(.ok, "实测样本", "48 小时内 \(count) 条 · 最新 \(age)前")
+        } else {
+            line(.warn, "实测样本", "48 小时内无实测记录，速度卡将回落到回归估计",
+                 fix: "env 注入后需重启 CC 会话才生效；Mirasim 派生会话不经此通道，属预期")
         }
     }
 

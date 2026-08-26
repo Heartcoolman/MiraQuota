@@ -12,6 +12,15 @@ LOG="$HOME/.miraquota/agent.log"
 
 ./scripts/bundle.sh
 
+# 客户端里已有控件时是否保留菜单栏图标（两处同时显示）。装过一次就沿用上次的选择，
+# 首次安装可用 MIRAQUOTA_STATUS_ALWAYS=1 ./scripts/install.sh 打开。
+PRIOR=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:MIRAQUOTA_STATUS_ALWAYS" "$PLIST" 2>/dev/null || true)
+ENV_BLOCK=""
+if [ "${MIRAQUOTA_STATUS_ALWAYS:-$PRIOR}" = "1" ]; then
+  ENV_BLOCK='  <key>EnvironmentVariables</key>
+  <dict><key>MIRAQUOTA_STATUS_ALWAYS</key><string>1</string></dict>'
+fi
+
 # 装到 ~/Applications 而非 build/，避免仓库移动或清理后自启指向空路径。
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/.miraquota"
 rm -rf "$DEST"
@@ -40,6 +49,7 @@ cat > "$PLIST" <<PLIST
   <key>ProgramArguments</key>
   <array><string>$BIN</string></array>
   <key>RunAtLoad</key><true/>
+$ENV_BLOCK
   <!-- 崩溃才拉起；从面板点「退出」是正常退出，保持退出状态直到下次登录。 -->
   <key>KeepAlive</key>
   <dict><key>SuccessfulExit</key><false/></dict>

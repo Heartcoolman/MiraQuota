@@ -3,9 +3,15 @@ import Foundation
 /// 成本账本：增量扫描 Claude Code 的 transcript 与 Mirasim 的网关账本，
 /// 把每次调用的 token 折算成 API 等价美元，按分钟聚合。
 ///
-/// 两个来源存在重叠：transcript 覆盖全部 Claude Code 调用且 token 完整，
-/// 网关账本对 relay 未回填的记录留空。故 Claude Code 侧只认 transcript，
-/// 账本只用于补齐 pi-gui 一类不经 Claude Code 的智能体。
+/// 两个来源都不完备，故取并集，用 Anthropic 的 request id 跨源去重
+/// （transcript 的 `requestId` 即网关账本的 `providerCallId`）：
+///
+/// - transcript 的 token 完整、可回溯全部历史，但只记录写回会话的助手消息。
+///   标题生成、被丢弃的响应、文件已被清理的子代理会话都不在其中，本机实测
+///   这部分占网关所见支出的约 18%。
+/// - 网关账本记下每一次经中继的请求，与中继自报的额度百分比拟合最紧
+///   （30 分钟分块回归 R² 0.85/0.99，仅 transcript 为 0.80/0.82），
+///   但 token 由 relay 回填、只重扫尾部窗口，早于窗口的记录取不回。
 final class CostLedger {
     /// 只保留该时长内的数据，覆盖 7d 窗口并留出余量。
     static let retention: TimeInterval = 8 * 86400
@@ -28,10 +34,16 @@ final class CostLedger {
         var cursors: [String: Cursor] = [:]
         /// unix 分钟 → 美元
         var buckets: [String: Double] = [:]
-        /// requestId → unix 分钟，用于跨文件去重（fork / resume 会复制历史消息）
+        /// 账目键 → 入桶的 unix 分钟。跨文件与跨来源去重都靠它
+        /// （fork / resume 会复制历史消息；同一次调用两侧各记一次）。
         var seen: [String: Int] = [:]
-        /// 网关账本的按 id 账目。必须是 Optional：合成 Codable 只对 Optional 走
-        /// decodeIfPresent，旧 ledger.json 缺该键时非可选会让整个状态解码失败被静默清空。
+        /// 账目键 → 已计入的美元。同一次调用先被看到的那次可能是残缺值：
+        /// transcript 的流式中间行只带部分 output，网关账本的 token 由 relay 事后回填。
+        /// 记下已计金额，再见到更大的值时只补差额，桶归属留在首见的分钟。
+        /// 必须是 Optional：合成 Codable 只对 Optional 走 decodeIfPresent，
+        /// 旧 ledger.json 缺该键时非可选会让整个状态解码失败被静默清空。
+        var booked: [String: Double]? = nil
+        /// 旧版按账本行 id 单独存的网关账目，只在 `load` 里并进 `seen` 与 `booked`。
         var gateway: [String: GatewayEntry]? = nil
     }
 
@@ -44,6 +56,8 @@ final class CostLedger {
     /// 本会话已计过数的 id。网关账本每轮重扫，不去重会把同一行反复累进计数器。
     private var countedUnpriced: Set<String> = []
     private var countedLedger: Set<String> = []
+    /// 本进程是否已整读过网关账本。
+    private var fullGatewayScanDone = false
 
     /// 分钟桶的有序前缀和。标定一次会调用 `spent` 成百上千次，
     /// 逐次全表扫描并解析字符串键，开销随「样本数 × 桶数」成平方级增长。
@@ -57,6 +71,9 @@ final class CostLedger {
     init(pricing: Pricing) {
         self.pricing = pricing
         load()
+        // 没有状态文件时 load 直接返回，这里兜住：账目表为 nil 时下面所有
+        // `state.booked?[key] = …` 都会静默丢弃，两侧的补差额随之失效。
+        if state.booked == nil { state.booked = [:] }
     }
 
     // MARK: 持久化
@@ -65,6 +82,13 @@ final class CostLedger {
         guard let data = try? Data(contentsOf: Paths.ledgerState),
               let p = try? JSONDecoder().decode(Persisted.self, from: data) else { return }
         state = p
+        if state.booked == nil { state.booked = [:] }
+        // 旧状态的网关账目按账本行 id 记账，并入统一的账目键，升级后不重复计入。
+        for (id, entry) in state.gateway ?? [:] where state.booked?[id] == nil {
+            state.seen[id] = entry.minute
+            state.booked?[id] = entry.usd
+        }
+        state.gateway = nil
     }
 
     private func save() {
@@ -102,8 +126,10 @@ final class CostLedger {
         return changed
     }
 
-    /// 首扫回溯上限与每轮重扫窗口，对齐 SpeedStats 对同一文件族的口径。
-    private static let gatewayFirstScan = 4 << 20
+    /// 首扫读整个文件，保留窗口由 `parseGatewayLine` 的 cutoff 判定。
+    /// 不能沿用尾部窗口：账本每行约 700 字节，4 MB 只回溯到一天多以前，
+    /// 新装或长期未运行时 7d 窗口的前半段会整段缺失。
+    private static let gatewayFirstScan = Int.max
     private static let gatewayRescan = 1 << 20
 
     /// 网关账本**不是**追加型：token 由 relay 回填、原地改写历史行，
@@ -114,8 +140,10 @@ final class CostLedger {
         guard let files = try? fm.contentsOfDirectory(
             at: Paths.mirasimInsights,
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]) else { return false }
-        if state.gateway == nil { state.gateway = [:] }
-        let window = state.gateway!.isEmpty ? Self.gatewayFirstScan : Self.gatewayRescan
+        // 每次启动先整读一遍：停机期间的记录与升级前漏掉的记录都在这一遍补齐，
+        // 之后按尾部窗口重扫。重复入账由账目键拦下，整读只是多解析几万行。
+        let window = fullGatewayScanDone ? Self.gatewayRescan : Self.gatewayFirstScan
+        fullGatewayScanDone = true
         var changed = false
         for file in files where file.lastPathComponent.hasPrefix("usage-") && file.pathExtension == "ndjson" {
             let attrs = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
@@ -124,7 +152,7 @@ final class CostLedger {
             gatewayScanned[file.path] = attrs?.contentModificationDate
             guard let handle = try? FileHandle(forReadingFrom: file) else { continue }
             defer { try? handle.close() }
-            let offset = max(0, size - window)
+            let offset = window >= size ? 0 : size - window
             try? handle.seek(toOffset: UInt64(offset))
             guard let data = try? handle.readToEnd(), !data.isEmpty else { continue }
             // 起点可能落在半行中间，跳过第一行。
@@ -213,10 +241,9 @@ final class CostLedger {
 
         let minute = epoch / 60
         let requestId = (root["requestId"] as? String) ?? (message["id"] as? String)
-        if let rid = requestId {
-            if state.seen[rid] != nil { return }
-            state.seen[rid] = minute
-        }
+        // 已计过且知道金额：一次响应会写成多行（思考、工具调用、正文各一行），
+        // 靠前的行只带部分 output，取最大值补差额，否则整段输出按残值定格。
+        if let rid = requestId, state.booked?[rid] == nil, state.seen[rid] != nil { return }
 
         let model = (message["model"] as? String) ?? ""
         guard let usd = pricing.cost(model: model,
@@ -227,6 +254,19 @@ final class CostLedger {
             unpricedRecords += 1
             return
         }
+        guard let rid = requestId else {
+            add(minute: minute, usd: usd)
+            transcriptRecords += 1
+            return
+        }
+        if let prior = state.booked?[rid] {
+            guard usd > prior else { return }
+            add(minute: state.seen[rid] ?? minute, usd: usd - prior)
+            state.booked?[rid] = usd
+            return
+        }
+        state.seen[rid] = minute
+        state.booked?[rid] = usd
         add(minute: minute, usd: usd)
         transcriptRecords += 1
     }
@@ -237,14 +277,22 @@ final class CostLedger {
               let ts = root["ts"] as? String,
               let epoch = fastEpochSeconds(ts), epoch >= cutoff,
               (root["provider"] as? String) == "anthropic" else { return false }
-
-        // Claude Code 的调用由 transcript 全量覆盖，此处只补别的智能体。
-        let agent = (root["agent"] as? String) ?? ""
-        guard agent != "claude", agent != "codex" else { return false }
-
         guard let id = root["id"] as? String else { return false }
-        // 旧版按字节游标入过账的行只有 seen 记录、没有金额，无从补差，跳过防止重复计入。
-        if state.seen[id] != nil { return false }
+
+        // 账目键优先取 providerCallId：它与 transcript 的 requestId 同值，
+        // 同一次调用两侧谁先落账都记在同一个键上，另一侧据此补差额而非重复计入。
+        // 旧状态按账本行 id 认领过的行仍按 id 走，否则升级后会再计一遍。
+        let providerCallId = root["providerCallId"] as? String
+        let key = state.seen[id] != nil ? id : (providerCallId ?? id)
+        let prior = state.booked?[key]
+        if prior == nil {
+            // 有 seen 无金额：旧版按字节游标入过账，无从补差，跳过防止重复计入。
+            if state.seen[key] != nil { return false }
+            // 缺 providerCallId 的行无法与 transcript 对齐（本机占全部行的 0.5%）：
+            // claude / codex 的调用另有 transcript 覆盖，宁可漏计也不重复计。
+            let agent = (root["agent"] as? String) ?? ""
+            if providerCallId == nil, agent == "claude" || agent == "codex" { return false }
+        }
 
         let model = (root["model"] as? String) ?? ""
         let usd = model.isEmpty ? nil : pricing.cost(model: model,
@@ -258,14 +306,15 @@ final class CostLedger {
             if countedUnpriced.insert(id).inserted { unpricedRecords += 1 }
             return false
         }
-        let minute = epoch / 60
-        if let entry = state.gateway?[id] {
-            guard usd > entry.usd else { return false }
+        if let prior {
+            guard usd > prior else { return false }
             // 回填把金额补大了：差额记回首见的分钟，桶归属不漂移。
-            add(minute: entry.minute, usd: usd - entry.usd)
-            state.gateway?[id] = GatewayEntry(minute: entry.minute, usd: usd)
+            add(minute: state.seen[key] ?? epoch / 60, usd: usd - prior)
+            state.booked?[key] = usd
         } else {
-            state.gateway?[id] = GatewayEntry(minute: minute, usd: usd)
+            let minute = epoch / 60
+            state.seen[key] = minute
+            state.booked?[key] = usd
             add(minute: minute, usd: usd)
             if countedLedger.insert(id).inserted { ledgerRecords += 1 }
         }
@@ -291,7 +340,8 @@ final class CostLedger {
         let before = state.buckets.count
         state.buckets = state.buckets.filter { (Int($0.key) ?? 0) >= minCutoff }
         state.seen = state.seen.filter { $0.value >= minCutoff }
-        state.gateway = state.gateway.map { $0.filter { $0.value.minute >= minCutoff } }
+        // 金额账目与 seen 同生共死：键一致，靠 seen 的分钟判龄。
+        state.booked = state.booked.map { $0.filter { state.seen[$0.key] != nil } }
         // 游标只对 transcript 有意义（网关账本走上面的重扫）；
         // 已删除文件的条目会随 save 永远写回，不清理则 ledger.json 无界增长。
         state.cursors = state.cursors.filter { key, _ in

@@ -1,6 +1,21 @@
 import SwiftUI
 import Combine
 
+/// 语义色随外观取不同深浅：系统 `.orange`/`.green` 是亮色系，浅色外观下盖在
+/// 磨砂材质上对比度不足；取值与 JS 控件浅色主题的 `--warn`/`--ok` 一致。
+extension Color {
+    static let warnTone = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(srgbRed: 1.00, green: 0.69, blue: 0.30, alpha: 1)   // #ffb04d
+            : NSColor(srgbRed: 0.70, green: 0.42, blue: 0.02, alpha: 1)   // #b26a05
+    })
+    static let okTone = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.30, green: 0.83, blue: 0.44, alpha: 1)   // #4cd471
+            : NSColor(srgbRed: 0.12, green: 0.62, blue: 0.31, alpha: 1)   // #1e9e50
+    })
+}
+
 struct PanelView: View {
     @ObservedObject var engine: QuotaEngine
     @State private var now = Date()
@@ -9,7 +24,7 @@ struct PanelView: View {
     @State private var ticker: AnyCancellable?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 9) {
             header
 
             if let notice = engine.report.accountNotice {
@@ -22,7 +37,7 @@ struct PanelView: View {
             if engine.report.windows.isEmpty {
                 empty
             } else {
-                VStack(spacing: 8) {
+                VStack(spacing: 6) {
                     ForEach(Array(engine.report.windows.enumerated()), id: \.element.label) { index, w in
                         WindowCard(window: w, now: now, measured: engine.report.state.isMeasured,
                                    primary: index == 0)
@@ -36,8 +51,13 @@ struct PanelView: View {
 
             footer
         }
-        .padding(14)
-        .frame(width: 344)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
+        .frame(width: 340)
+        // NSPopover 默认材质只做模糊、不做亮度校正，暗背景透进来会压暗整个面板。
+        // 系统菜单的 .menu 材质自带向主题底色的亮度提升（浅色外观推白、深色推黑），
+        // 深色壁纸下仍是浅灰模糊底，磨砂感与可读性同时保住；纯色垫层则会盖掉模糊。
+        .background(FrostBackground())
         .onAppear {
             now = Date()
             ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -59,7 +79,7 @@ struct PanelView: View {
             statusChip
             Button { engine.refresh() } label: {
                 Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 11.5, weight: .semibold))
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
@@ -69,24 +89,24 @@ struct PanelView: View {
 
     private var statusChip: some View {
         HStack(spacing: 4) {
-            Circle().fill(statusTone).frame(width: 6, height: 6)
+            Circle().fill(statusTone).frame(width: 5, height: 5)
             Text(engine.report.state.label)
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2.5)
         .background(Capsule().fill(statusTone.opacity(0.12)))
-        .animation(.easeOut(duration: 0.25), value: engine.report.state)
+        .animation(.smooth(duration: 0.3), value: engine.report.state)
         .help(engine.report.state.detail ?? "数据来自 Mirasim 本地通道")
     }
 
     private var statusTone: Color {
         switch engine.report.state {
-        case .exact: return .green
+        case .exact: return .okTone
         case .live: return .mint
         case .stale: return .yellow
-        case .reckoned: return .orange
+        case .reckoned: return .warnTone
         case .mismatch: return .red
         case .local, .connecting: return .gray
         }
@@ -95,22 +115,22 @@ struct PanelView: View {
     private func banner(_ text: String) -> some View {
         HStack(alignment: .top, spacing: 6) {
             Image(systemName: "info.circle")
-                .font(.system(size: 10))
+                .font(.system(size: 10.5))
                 .foregroundStyle(statusTone)
                 .padding(.top, 1)
             Text(text)
-                .font(.system(size: 10))
+                .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
-        .padding(8)
-        .background(RoundedRectangle(cornerRadius: 7).fill(statusTone.opacity(0.08)))
+        .padding(7)
+        .background(RoundedRectangle(cornerRadius: 6).fill(statusTone.opacity(0.08)))
     }
 
     private var empty: some View {
         Text("等待 Mirasim 回传额度…")
-            .font(.system(size: 11))
+            .font(.system(size: 12))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 14)
@@ -119,38 +139,41 @@ struct PanelView: View {
     // MARK: 脚
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
             Divider()
             if let price = engine.report.unitPriceUSD {
                 metaRow("满额", String(format: "回归标定优先 · 兜底 额度点 × $%.6f", price))
             } else if !engine.report.windows.isEmpty {
                 metaRow("标定", calibrationLine)
             }
-            metaRow("账本", "\(engine.report.bucketCount) 分钟桶 · 本轮新增 \(engine.report.newRecords) 条")
-            metaRow("价目", engine.pricingSource)
-            metaRow("线路", "\(modeLabel) \(engine.report.host) · \(engine.report.relayStatus)")
-            HStack {
+            metaRow("账本", "\(engine.report.bucketCount) 分钟桶 · 新增 \(engine.report.newRecords) 条 · \(engine.pricingSource)")
+            HStack(spacing: 5) {
                 Text(Self.clock.string(from: engine.report.capturedAt))
-                    .font(.system(size: 9, design: .monospaced))
+                    .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
-                Spacer()
+                Text("\(modeLabel) \(engine.report.host) · \(engine.report.relayStatus)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
                 Button("退出") { NSApplication.shared.terminate(nil) }
                     .buttonStyle(.plain)
-                    .font(.system(size: 10))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
             }
-            .padding(.top, 2)
+            .padding(.top, 1)
         }
     }
 
     private func metaRow(_ key: String, _ value: String) -> some View {
         HStack(alignment: .top, spacing: 6) {
             Text(key)
-                .font(.system(size: 9, weight: .medium))
+                .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.tertiary)
-                .frame(width: 24, alignment: .leading)
+                .frame(width: 25, alignment: .leading)
             Text(value)
-                .font(.system(size: 9))
+                .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -179,6 +202,18 @@ struct PanelView: View {
     }()
 }
 
+/// 面板底衬：取系统菜单同款材质，见 body 处说明。
+private struct FrostBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .menu
+        view.blendingMode = .behindWindow
+        view.state = .active
+        return view
+    }
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
 // MARK: - 窗口卡片
 
 /// 单个窗口：金额、百分比、带均速游标的进度条、重置倒计时。
@@ -191,14 +226,17 @@ private struct WindowCard: View {
     let primary: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline) {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
                 Text(Formatting.windowTitle(window.label))
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .frame(width: 74, alignment: .leading)
-                Text(Formatting.usd(window.scaledSpentUSD ?? window.spentUSD))
-                    .font(.system(size: primary ? 21 : 18, weight: .semibold, design: .rounded).monospacedDigit())
+                    .frame(width: 68, alignment: .leading)
+                Text(Formatting.usd(amount))
+                    .font(.system(size: primary ? 21 : 19, weight: .semibold, design: .rounded).monospacedDigit())
+                    // 数字过渡只挂在按报告刷新的字段上；倒计时那类秒级走动的不挂，否则每秒抖一次。
+                    .contentTransition(.numericText(value: amount))
+                    .animation(.smooth(duration: 0.35), value: amount)
                 Text(quotaSuffix)
                     .font(.system(size: 12, weight: .medium, design: .rounded).monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -210,17 +248,22 @@ private struct WindowCard: View {
 
             HStack(spacing: 6) {
                 Text(leftText)
-                    .font(.system(size: 10))
-                    .foregroundStyle(etaSoon ? .orange : .secondary)
-                Spacer()
+                    .font(.system(size: 10.5, weight: etaSoon ? .medium : .regular))
+                    .foregroundStyle(etaSoon ? Color.warnTone : Color.secondary)
+                    .padding(.horizontal, etaSoon ? 5 : 0)
+                    .padding(.vertical, etaSoon ? 1.5 : 0)
+                    // 纯色文字盖在磨砂材质上，色相稍暗时几乎读不出来；打满临近时才加底色垫一层，够不上阈值时不占地方。
+                    .background { if etaSoon { Capsule().fill(Color.warnTone.opacity(0.14)) } }
+                Spacer(minLength: 4)
                 Text(resetText)
-                    .font(.system(size: 10, design: .monospaced))
+                    // 时钟形式的倒计时用等宽稳住宽度；「5 天后重置」这类走等宽会拉出空隙。
+                    .font(.system(size: 10.5, design: resetText.contains(":") ? .monospaced : .default))
                     .foregroundStyle(.tertiary)
             }
 
             if let sub = subText {
                 Text(sub)
-                    .font(.system(size: 9).monospacedDigit())
+                    .font(.system(size: 9.5).monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
         }
@@ -228,14 +271,18 @@ private struct WindowCard: View {
         .help(hint)
     }
 
+    /// 主行金额：按点数口径折算优先，推算级退回账本支出。
+    private var amount: Double { window.scaledSpentUSD ?? window.spentUSD }
+
     private var percentBadge: some View {
         Text((window.inferred ? "≈" : "") + String(format: "%.1f%%", window.usedPercent))
             .font(.system(size: 11, weight: .semibold, design: .rounded).monospacedDigit())
             .foregroundStyle(tone)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1.5)
             .background(Capsule().fill(tone.opacity(0.13)))
-            .animation(.easeOut(duration: 0.3), value: window.usedPercent)
+            .contentTransition(.numericText(value: window.usedPercent))
+            .animation(.smooth(duration: 0.35), value: window.usedPercent)
     }
 
     /// 满额部分。未收敛的标定值标 `~`，避免把推断值读成确定值。
@@ -247,7 +294,7 @@ private struct WindowCard: View {
 
     private var tone: Color {
         if window.usedPercent >= 95 { return .red }
-        if window.usedPercent >= 80 { return .orange }
+        if window.usedPercent >= 80 { return .warnTone }
         return window.inferred ? .secondary : .accentColor
     }
 
@@ -320,11 +367,12 @@ private struct WindowCard: View {
 /// 卡片皮，窗口卡与速度卡共用。主窗口底色重一档。
 private extension View {
     func cardSkin(emphasis: Bool = false) -> some View {
-        padding(11)
+        padding(.horizontal, 10)
+            .padding(.vertical, 9)
             .background(
-                RoundedRectangle(cornerRadius: 10)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .fill(Color.primary.opacity(emphasis ? 0.075 : 0.045))
-                    .overlay(RoundedRectangle(cornerRadius: 10)
+                    .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1))
             )
     }
@@ -339,52 +387,58 @@ private struct SpeedCard: View {
     let now: Date
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text("速度")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if let oldest = report.inflightSince.first {
                     // 在途请求来自诊断事件流，请求发出瞬间即可见；出字速度仍要等落账。
                     HStack(spacing: 4) {
-                        Circle().fill(Color.green).frame(width: 6, height: 6)
+                        Circle().fill(Color.okTone).frame(width: 5, height: 5)
                         Text("生成中 \(report.inflightSince.count) 条 · 已 \(Int(now.timeIntervalSince(oldest))) 秒")
-                            .font(.system(size: 9, weight: .medium).monospacedDigit())
+                            .font(.system(size: 9.5, weight: .medium).monospacedDigit())
                     }
-                    .foregroundStyle(.green)
+                    .foregroundStyle(Color.okTone)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.okTone.opacity(0.13)))
                 } else {
                     Text("最近 \(report.recentCount) 次")
-                        .font(.system(size: 9))
+                        .font(.system(size: 9.5))
                         .foregroundStyle(.tertiary)
                 }
             }
 
             if report.rows.isEmpty, report.inflightSince.isEmpty {
                 Text("近期无请求（\(report.sampleTotal) 次）")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(report.rows, id: \.model) { row in
                     HStack(spacing: 6) {
                         Text(row.model)
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(.secondary)
-                            .frame(width: 58, alignment: .leading)
+                            .frame(width: 60, alignment: .leading)
                         Text(Self.detail(row))
-                            .font(.system(size: 10).monospacedDigit())
+                            .font(.system(size: 10.5).monospacedDigit())
                         // 闸门由 SpeedStats 统一把关（样本 ≥3、幅度进 25% 出 18%、
                         // 当下值不超过基准三倍），两个显示面不各自定阈值。
                         if let drift = row.notableDrift {
                             Text(String(format: "%@%.0f%%", drift > 0 ? "快" : "慢", abs(drift)))
-                                .font(.system(size: 10).monospacedDigit())
-                                .foregroundStyle(drift < 0 ? .orange : .green)
+                                .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+                                .foregroundStyle(drift < 0 ? Color.warnTone : Color.okTone)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill((drift < 0 ? Color.warnTone : Color.okTone).opacity(0.13)))
                         }
                         Spacer(minLength: 4)
                         // 显示样本新鲜度而非条数：数字不动多半是没有新请求，
                         // 把这件事说出来，免得看的人以为界面卡住了。
                         Text(Formatting.age(now.timeIntervalSince(row.latestAt)) + "前")
-                            .font(.system(size: 9, design: .monospaced))
+                            .font(.system(size: 9.5, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
                 }
@@ -398,20 +452,22 @@ private struct SpeedCard: View {
         guard let rate = row.rate else {
             return String(format: "端到端 %.0f tok/s", row.endToEnd)
         }
-        let head = row.ttft.map { String(format: "首 token ≈%.1fs · ", $0) } ?? ""
+        // 实测行的首 token 是逐请求测量值的中位数，不带 ≈；回归行才是截距估计。
+        let head = row.ttft.map { String(format: row.measured ? "首 %.1fs · " : "首 token ≈%.1fs · ", $0) } ?? ""
         return head + String(format: "%.0f tok/s", rate)
     }
 
     private var hint: String {
         var lines = [
             "出字速度取最近 \(report.recentCount) 次请求，按 token 加权，并对显示值做一阶平滑",
-            "首 token 无法逐次测量，取 48 小时内全部样本的回归截距，是慢变量",
-            "常态基准为同一批样本回归出的出字速度；端到端为输出量除以总时长，含首字等待",
+            "实测行（首 token 不带 ≈）：Claude Code OTel trace 逐请求上报首 token 与时长",
+            "回归行（首 token 带 ≈）：账本只有总时长，首 token 取 48 小时样本的回归截距",
+            "常态基准为同路径样本的出字速度；端到端为输出量除以总时长，含首字等待",
         ]
         if let m = report.measuredTurnTTFB {
             lines.append(String(format: "Mirasim 实测整轮首字节 中位 %.1fs（%d 次）· 口径为整轮而非单次请求，仅作量级对照", m.median, m.count))
         }
-        lines.append("数据源 ~/.mirasim/insights，token 未回填的请求不计入")
+        lines.append("数据源 ~/.miraquota/measured 与 ~/.mirasim/insights，token 未回填的请求不计入")
         return lines.joined(separator: "\n")
     }
 }
@@ -430,18 +486,18 @@ private struct ProgressBar: View {
                     .fill(LinearGradient(colors: [tone.opacity(0.65), tone],
                                          startPoint: .leading, endPoint: .trailing))
                     .frame(width: max(3, w * min(percent, 100) / 100))
-                    .animation(.easeOut(duration: 0.45), value: percent)
+                    .animation(.smooth(duration: 0.5), value: percent)
                 if let marker, marker > 1, marker < 99 {
                     // 均速游标：用量条越过它表示快于线性消耗。
                     Capsule()
                         .fill(Color.primary.opacity(0.5))
-                        .frame(width: 2, height: 7)
+                        .frame(width: 2, height: 6)
                         .offset(x: min(w - 2, w * marker / 100))
-                        .animation(.easeOut(duration: 0.45), value: marker)
+                        .animation(.smooth(duration: 0.5), value: marker)
                 }
             }
         }
-        .frame(height: 7)
+        .frame(height: 5)
     }
 }
 

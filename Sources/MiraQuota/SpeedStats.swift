@@ -10,6 +10,18 @@ import Foundation
 /// 按整个 5 小时窗口做中位数时，几百条样本会把新数据完全淹没，界面看上去不动。
 /// 混合模型会显著偏移，两者都分模型统计。
 final class SpeedStats {
+    /// OTLP 接收端落的逐请求实测：首 token 与总时长都是客户端测量值。
+    /// 有实测样本的模型不再走回归——两条路径描述的是同一批请求，只择一。
+    private struct MeasuredSample {
+        let at: Int
+        let model: String
+        let ttftMs: Int
+        let durationMs: Int
+        let out: Int
+        /// 会话 UUID。旧样本文件没有该字段，取空串，只进模型行不进会话行。
+        let session: String
+    }
+
     private struct Sample {
         let id: String
         let at: Int
@@ -38,8 +50,9 @@ final class SpeedStats {
     private static let minSeparation = 32
     /// 给出斜率所需的最少配对数，即最少 12 条样本。
     private static let minPairs = 6
-    /// 单个模型成行所需的最少样本数。
-    private static let minRow = 2
+    /// 单个模型成行所需的最少样本数。取 1：首个请求完成即显示，
+    /// 首样本的速率与首字为直显值、无中位可取，噪声由使用者自担。
+    private static let minRow = 1
     /// 出字速度取最近这么多次请求。取小才跟手，取大才平稳。
     /// 3 次时实测显示值在 145 秒内于 67–83 tok/s 间摆动、偏离提示反复翻转；
     /// 取 5 次并叠一层显示平滑（见 `rateSmoothing`）后仍能跟上新请求。
@@ -83,7 +96,12 @@ final class SpeedStats {
     /// 否则偏离贴着阈值时提示会逐轮出现与消失（实测 -32% 一段里仍闪了一次）。
     private var driftShown: Set<String> = []
 
+    /// 实测样本，按 requestId 去重：导出器至少送达一次，重试会产生重复行。
+    private var otlpSamples: [String: MeasuredSample] = [:]
+    private var measuredCursors: [String: Int] = [:]
+
     private static let durationNeedle = Array("\"durationMs\"".utf8)
+    private static let measuredNeedle = Array("\"ttftMs\"".utf8)
     private static let turnNeedle = Array("\"turn.finish\"".utf8)
     private static let modelEventNeedle = Array("\"kind\":\"model.".utf8)
     private static let usageNeedle = Array("\"usage\"".utf8)
@@ -95,6 +113,7 @@ final class SpeedStats {
         scanLedger(cutoff: cutoff)
         scanAnalytics()
         scanDiag()
+        scanMeasured(cutoff: cutoff)
         // 账本的 token 要等 relay 回填，时长也可能先落一个粗值；
         // transcript 与 diag 都是请求完成即写，用它们补齐才能反映当下。
         backfillFromTranscripts()
@@ -191,6 +210,35 @@ final class SpeedStats {
         if measured.count > Self.measuredKeep {
             measured.removeFirst(measured.count - Self.measuredKeep)
         }
+    }
+
+    /// 实测样本文件是本进程 OTLP 接收端追加写的，按天分片，游标增量读。
+    private func scanMeasured(cutoff: Int) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: Paths.measuredDir,
+                                                      includingPropertiesForKeys: nil) else { return }
+        for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+            where file.lastPathComponent.hasPrefix("speed-") && file.pathExtension == "ndjson" {
+            _ = consume(file, needle: Self.measuredNeedle, cursors: &measuredCursors, parse: parseMeasuredSample)
+        }
+        otlpSamples = otlpSamples.filter { $0.value.at >= cutoff }
+        // 日期分片三天即删，游标表跟着裁，常驻数周不裁会缓慢积累。
+        measuredCursors = measuredCursors.filter { fm.fileExists(atPath: $0.key) }
+    }
+
+    private func parseMeasuredSample(_ line: Data) {
+        guard let root = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let at = Self.int(root["at"]),
+              let model = root["model"] as? String, !model.isEmpty,
+              let ttft = Self.int(root["ttftMs"]), ttft > 0,
+              let ms = Self.int(root["durationMs"]), ms >= ttft else { return }
+        // 重试请求的时长含前几次的等待，扣除首 token 后的流式段失真，不进样本。
+        guard (root["success"] as? Bool) ?? true, (Self.int(root["attempt"]) ?? 1) == 1 else { return }
+        let rid = (root["requestId"] as? String) ?? ""
+        let key = rid.isEmpty ? "\(at):\(model):\(ms)" : rid
+        otlpSamples[key] = MeasuredSample(at: at, model: model, ttftMs: ttft,
+                                          durationMs: ms, out: Self.int(root["out"]) ?? 0,
+                                          session: (root["session"] as? String) ?? "")
     }
 
     /// Mirasim 的诊断事件流按小时一个文件，`model.begin` 在请求发出瞬间写入，
@@ -389,25 +437,37 @@ final class SpeedStats {
 
     // MARK: 估计
 
-    /// 按模型给出「最近几次」的速度。账本里一条样本都没有时返回 nil，界面据此整卡隐藏。
+    /// 按模型给出「最近几次」的速度。两路样本都空时返回 nil，界面据此整卡隐藏。
     func report(now: Date = Date()) -> SpeedReport? {
         let pool = usable
-        guard !pool.isEmpty || !flights.isEmpty else { return nil }
+        let mPool = Array(otlpSamples.values)
+        guard !pool.isEmpty || !mPool.isEmpty || !flights.isEmpty else { return nil }
         let horizon = Diag.speedSpan ?? Self.recencyLimit
         let fresh = Int(now.addingTimeInterval(-horizon).timeIntervalSince1970)
 
         var byModel: [String: [Sample]] = [:]
         for s in pool { byModel[s.model, default: []].append(s) }
+        var measuredByModel: [String: [MeasuredSample]] = [:]
+        for s in mPool { measuredByModel[s.model, default: []].append(s) }
 
-        let rows = byModel.values
-            .compactMap { estimate($0, fresh: fresh) }
+        // 实测行优先。经 4977/4979 的请求账本里也有记录，两条路径描述同一批
+        // 请求，只择一不叠加；Mirasim 派生会话不发 OTel，回归是它们唯一的路。
+        let rows = Set(byModel.keys).union(measuredByModel.keys)
+            .compactMap { model in
+                measuredEstimate(measuredByModel[model] ?? [], fresh: fresh)
+                    ?? estimate(byModel[model] ?? [], fresh: fresh)
+            }
             .sorted { $0.latestAt > $1.latestAt }
             .prefix(3)
 
+        // 两路对同一请求各计一条，取大者近似去重后的量级。
+        let sampleTotal = max(pool.filter { $0.at >= fresh }.count,
+                              mPool.filter { $0.at >= fresh }.count)
         return SpeedReport(
             rows: Array(rows),
+            sessions: sessionRows(pool: mPool, fresh: fresh),
             recentCount: Self.recentCount,
-            sampleTotal: pool.filter { $0.at >= fresh }.count,
+            sampleTotal: sampleTotal,
             inflightSince: flights.values.sorted()
                 .map { Date(timeIntervalSince1970: Double($0)) },
             measuredTurnTTFB: Self.median(measured).map {
@@ -462,6 +522,90 @@ final class SpeedStats {
         row.notableDrift = row.driftPasses(shown: driftShown.contains(key))
         if row.notableDrift == nil { driftShown.remove(key) } else { driftShown.insert(key) }
         return row
+    }
+
+    /// 实测行：首 token 与总时长都是逐请求测量值，扣除用样本自己的首 token，
+    /// 不存在回归截距失配把短请求推到时长下限的伪影。首 token 取最近几次的
+    /// 中位数，随样本刷新，是快变量；基准为保留期内全部实测样本的加权速率。
+    private func measuredEstimate(_ group: [MeasuredSample], fresh: Int) -> SpeedRow? {
+        let byTime = group.sorted { $0.at < $1.at }
+        guard let newest = byTime.last, newest.at >= fresh else { return nil }
+        let recent = Array(byTime.suffix(Self.recentCount)).filter { $0.at >= fresh }
+        guard recent.count >= Self.minRow else { return nil }
+
+        let ttft = Self.median(recent.map { Double($0.ttftMs) / 1000 })
+
+        // 速率仍按 token 加权。输出太少的样本流式段不足以稳定测速，
+        // 只参与首 token 的中位数，不参与速率。
+        func weighted(_ samples: [MeasuredSample]) -> Double? {
+            let eligible = samples.filter { $0.out >= Self.minOutput && $0.durationMs > $0.ttftMs }
+            let out = eligible.reduce(0) { $0 + $1.out }
+            let seconds = eligible.reduce(0.0) { $0 + Double($1.durationMs - $1.ttftMs) / 1000 }
+            guard seconds > 0 else { return nil }
+            let r = Double(out) / seconds
+            return (r >= 5 && r <= 1000) ? r : nil
+        }
+        var rate = weighted(recent)
+        let baselineRate = weighted(group)
+
+        let out = recent.reduce(0) { $0 + $1.out }
+        let ms = recent.reduce(0) { $0 + $1.durationMs }
+        let endToEnd = ms > 0 ? Double(out) / (Double(ms) / 1000) : 0
+
+        // 显示平滑与回归行共用一张表：模型在两条路径间切换时收敛而不是跳变。
+        let key = Self.shortName(newest.model)
+        if let raw = rate {
+            if let prev = shownRate[key], prev > 0, abs(raw - prev) / prev <= Self.rateJump {
+                rate = prev + (raw - prev) * Self.rateSmoothing
+            }
+            shownRate[key] = rate ?? raw
+        } else {
+            shownRate[key] = nil
+        }
+
+        var row = SpeedRow(model: key, samples: recent.count,
+                           ttft: ttft, rate: rate, endToEnd: endToEnd,
+                           baselineRate: baselineRate,
+                           latestAt: Date(timeIntervalSince1970: Double(newest.at)))
+        row.measured = true
+        row.notableDrift = row.driftPasses(shown: driftShown.contains(key))
+        if row.notableDrift == nil { driftShown.remove(key) } else { driftShown.insert(key) }
+        return row
+    }
+
+    /// 按会话分行：每个 Claude Code 窗口是一个会话，状态栏据此只显示
+    /// 本窗口的速度，不被并行窗口的高频请求顶掉。只用实测样本
+    /// （span 带 session.id，账本没有会话身份），会话中途换模型时
+    /// 只取最近模型的样本，避免混合模型偏移。不做显示平滑：
+    /// 实测值只在新请求完成时变动，逐请求跳变即是本义。
+    /// 首 token 取最近一次实测而非窗口中位数：中位数下单次长排队会在
+    /// 其后数次请求里持续占据显示值，与当前工况脱节。
+    private func sessionRows(pool: [MeasuredSample], fresh: Int) -> [SessionSpeedRow] {
+        var bySession: [String: [MeasuredSample]] = [:]
+        for s in pool where !s.session.isEmpty {
+            bySession[s.session, default: []].append(s)
+        }
+        let rows = bySession.compactMap { session, group -> SessionSpeedRow? in
+            let byTime = group.sorted { $0.at < $1.at }
+            guard let newest = byTime.last, newest.at >= fresh else { return nil }
+            let recent = Array(byTime.filter { $0.model == newest.model }.suffix(Self.recentCount))
+            let ttft = recent.last.map { Double($0.ttftMs) / 1000 }
+            // 输出太少的样本流式段不足以稳定测速，只参与首 token，不参与速率。
+            let eligible = recent.filter { $0.out >= Self.minOutput && $0.durationMs > $0.ttftMs }
+            let out = eligible.reduce(0) { $0 + $1.out }
+            let seconds = eligible.reduce(0.0) { $0 + Double($1.durationMs - $1.ttftMs) / 1000 }
+            var rate: Double?
+            if seconds > 0 {
+                let r = Double(out) / seconds
+                if r >= 5, r <= 1000 { rate = r }
+            }
+            guard ttft != nil || rate != nil else { return nil }
+            return SessionSpeedRow(session: session, model: Self.shortName(newest.model),
+                                   samples: recent.count, ttft: ttft, rate: rate,
+                                   latestAt: Date(timeIntervalSince1970: Double(newest.at)))
+        }
+        // 活跃会话数量无上界，按最近排序截断，防 payload 无界。
+        return Array(rows.sorted { $0.latestAt > $1.latestAt }.prefix(8))
     }
 
     /// 保留期内全部样本的回归：斜率给出字速度基准，截距给首 token。

@@ -243,7 +243,9 @@
   .dot.mismatch { background: var(--bad); }
   .sep { width: .5px; height: 11px; background: var(--bd); }
   .lb { color: var(--ink2); font-weight: 600; }
-  .v.warn { color: var(--warn); } .v.bad { color: var(--bad); }
+  /* 纯色文字盖在磨砂材质上，色相接近背景时几乎读不出来，垫一层同色底色。 */
+  .v.warn { color: var(--warn); background: var(--warnbg); border-radius: 5px; padding: 0 3px; }
+  .v.bad { color: var(--bad); background: var(--badbg); border-radius: 5px; padding: 0 3px; }
   .u { color: var(--ink3); }
 
   .pop {
@@ -304,7 +306,7 @@
   .foot { display: flex; margin-top: 5px; font-size: 9.5px; color: var(--ink2);
     white-space: nowrap; font-variant-numeric: tabular-nums; }
   .foot .eta { color: var(--ink2); margin-left: 4px; }
-  .foot .eta.soon { color: var(--warn); }
+  .foot .eta.soon { color: var(--warn); background: var(--warnbg); border-radius: 5px; padding: 0 4px; margin-left: 2px; }
   .foot .r { margin-left: auto; padding-left: 8px; color: var(--ink3); }
   .sub { margin-top: 3px; font-size: 9px; color: var(--ink3); white-space: nowrap;
     font-variant-numeric: tabular-nums; }
@@ -313,9 +315,11 @@
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sp .v { font-variant-numeric: tabular-nums; color: var(--ink2); white-space: nowrap; }
   .sp .dr { font-variant-numeric: tabular-nums; }
-  .sp .dr.slow { color: var(--warn); } .sp .dr.fast { color: var(--ok); }
+  .sp .dr.slow { color: var(--warn); background: var(--warnbg); border-radius: 5px; padding: 0 4px; }
+  .sp .dr.fast { color: var(--ok); background: var(--okbg); border-radius: 5px; padding: 0 4px; }
   .sp .n { margin-left: auto; color: var(--ink3); font-size: 9.5px; font-variant-numeric: tabular-nums; }
-  .live { display: inline-flex; align-items: center; gap: 4px; font-size: 9.5px; color: var(--ok); font-weight: 600; }
+  .live { display: inline-flex; align-items: center; gap: 4px; font-size: 9.5px; color: var(--ok); font-weight: 600;
+    background: var(--okbg); border-radius: 8px; padding: 2px 7px; }
   .pulse { width: 6px; height: 6px; border-radius: 3px; background: var(--ok); animation: mqPulse 1.2s ease-in-out infinite; }
   @keyframes mqPulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .3; transform: scale(.7); } }
   .meta { font-size: 9.5px; color: var(--ink3); line-height: 1.6; }
@@ -944,8 +948,9 @@
       const r = speedRowFor(row.model);
       setText(r.m, shortModel(row.model));
       r.m.title = row.model;
+      // measured 为真时首 token 是逐请求实测值，不带 ≈；缺字段按回归行处理。
       setText(r.v, row.rate == null ? `端到端 ${row.endToEnd.toFixed(0)} tok/s`
-        : (row.ttft != null ? `首 ≈${row.ttft.toFixed(1)}s · ` : '') + `${row.rate.toFixed(0)} tok/s`);
+        : (row.ttft != null ? `首 ${row.measured ? '' : '≈'}${row.ttft.toFixed(1)}s · ` : '') + `${row.rate.toFixed(0)} tok/s`);
       // 阈值由 Swift 侧统一把关（SpeedRow.notableDrift），这里只显示给了值的那一档。
       const drift = row.driftNotable;
       setText(r.dr, drift == null ? '' : `${drift > 0 ? '快' : '慢'}${Math.abs(drift).toFixed(0)}%`);

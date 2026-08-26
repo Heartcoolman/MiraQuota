@@ -183,6 +183,9 @@ struct SpeedRow: Sendable {
     let baselineRate: Double?
     /// 该模型最近一次请求的时刻。
     let latestAt: Date
+    /// 本行来自逐请求实测（Claude Code OTel trace）而非回归估计。
+    /// 实测行的首 token 不带 `≈`：它是测量值的中位数，不是截距。
+    var measured: Bool = false
     /// 界面显示的偏离。闸门带迟滞（进 25% / 出 18%），由 SpeedStats 判定后填入：
     /// 纯阈值在边界附近会随每轮微小变动反复出现与消失。
     var notableDrift: Double? = nil
@@ -203,6 +206,20 @@ struct SpeedRow: Sendable {
     }
 }
 
+/// 单个 Claude Code 会话（窗口）的速度估计。只有实测路径可得：
+/// OTel span 自带 `session.id`，网关账本没有会话身份。
+/// 状态栏据此按窗口取数，多窗口并行时互不串行。
+struct SessionSpeedRow: Sendable {
+    /// Claude Code 的会话 UUID，与 transcript 文件名一致。
+    let session: String
+    /// 会话内最近一次请求的模型短名。
+    let model: String
+    let samples: Int
+    let ttft: Double?
+    let rate: Double?
+    let latestAt: Date
+}
+
 /// 速度结论。近期无请求时 `rows` 为空，属常态而非异常。
 struct SpeedReport: Sendable {
     /// Mirasim 自己测的整轮首字节，只作量级对照。
@@ -212,6 +229,8 @@ struct SpeedReport: Sendable {
     }
 
     let rows: [SpeedRow]
+    /// 按会话分行，供状态栏按窗口取数。近期无实测样本时为空。
+    let sessions: [SessionSpeedRow]
     /// 每行最多取的最近请求数。
     let recentCount: Int
     /// 近期时间范围内通过筛选的请求数，含未成行的模型。

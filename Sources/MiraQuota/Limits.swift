@@ -42,12 +42,19 @@ final class LimitsClient {
     private static let minInterval: TimeInterval = 15
     /// 端口枚举全军覆没后的静默期。旧版 Mirasim 没有这个端点，不必每 15 秒重扫一遍。
     private static let rediscoverAfter: TimeInterval = 300
+    /// mirachannel 首页端口。server.cjs 一起来就绑定，且只回 HTML，
+    /// 不能拿它的失败当作「这版 Mirasim 没有该端点」的证据。
+    private static let homePort = 4970
 
     private let lock = NSLock()
     private var cachedPort: Int?
     private var last: LimitsSnapshot?
     private var lastAttempt = Date.distantPast
     private var discoveryFailedAt = Date.distantPast
+    /// 端点在本机确认可用过。静默期只该拦「这版 Mirasim 没有该端点」；
+    /// 端点挂在会话端口上，会话退出端口即消失，新会话的端口晚几秒才起来，
+    /// 确认过存在之后的失败都是这类瞬态，进静默期会让面板平白降级五分钟。
+    private var endpointConfirmed = false
 
     /// 取当前额度。`anchorPort` 是已连上的 mirachannel 端口，探测只在同一进程持有的
     /// 端口上进行，避免读到另一个 Mirasim 实例（可能是另一个账号）的额度。
@@ -75,16 +82,18 @@ final class LimitsClient {
                     break
                 }
             }
-            // 只有「端口在、但都没有这个端点」才进静默期——那是旧版 Mirasim 的表现。
-            // 一个端口都没枚举到只说明 Mirasim 正在起或刚重启，下一轮就该再试，
-            // 否则重启后要干等五分钟才恢复精确口径。
-            if found == nil, !candidates.isEmpty {
+            // 只有「会话端口在、却没有这个端点、且从未成功过」才进静默期——
+            // 那是旧版 Mirasim 的表现。候选只剩首页端口说明会话尚未注册：
+            // Mirasim 重启后首页端口立刻就绪，会话端口要晚几十秒；
+            // 确认过端点的实例失败属会话端口更替，两者按常规间隔重试即可。
+            if found == nil, !endpointConfirmed,
+               candidates.contains(where: { $0 != Self.homePort }) {
                 lock.lock(); discoveryFailedAt = now; lock.unlock()
             }
         }
 
         lock.lock()
-        if found == nil { cachedPort = nil }
+        if found == nil { cachedPort = nil } else { endpointConfirmed = true }
         last = found
         lock.unlock()
         return found
@@ -189,7 +198,7 @@ final class LimitsClient {
             ports = byPID.values.flatMap { $0 }
         }
         // mirachannel 那个端口回的是首页 HTML，放到最后再试。
-        return Array(Set(ports)).sorted { a, b in (a == 4970 ? 1 : 0) < (b == 4970 ? 1 : 0) }
+        return Array(Set(ports)).sorted { a, b in (a == homePort ? 1 : 0) < (b == homePort ? 1 : 0) }
     }
 
     private static func mirasimPIDs() -> [Int] {

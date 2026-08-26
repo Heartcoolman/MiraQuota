@@ -251,6 +251,7 @@ final class Feed {
             "rows": s.rows.map { row -> [String: Any] in
                 var r: [String: Any] = ["model": row.model, "samples": row.samples,
                                         "endToEnd": row.endToEnd,
+                                        "measured": row.measured,
                                         "latestAt": row.latestAt.timeIntervalSince1970]
                 if let t = row.ttft { r["ttft"] = t }
                 if let rate = row.rate { r["rate"] = rate }
@@ -259,6 +260,15 @@ final class Feed {
                 // 界面只显示过闸门的偏离，阈值由 SpeedRow.notableDrift 统一把关，
                 // 两个显示面不各自定阈值。
                 if let notable = row.notableDrift { r["driftNotable"] = notable }
+                return r
+            },
+            // 按会话分行，状态栏据此只取本窗口的数据。全部来自实测路径。
+            "sessions": s.sessions.map { row -> [String: Any] in
+                var r: [String: Any] = ["session": row.session, "model": row.model,
+                                        "samples": row.samples, "measured": true,
+                                        "latestAt": row.latestAt.timeIntervalSince1970]
+                if let t = row.ttft { r["ttft"] = t }
+                if let rate = row.rate { r["rate"] = rate }
                 return r
             },
         ]

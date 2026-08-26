@@ -21,6 +21,7 @@ if arguments.contains("--help") || arguments.contains("-h") {
       额度百分比  退路，Mirasim 本地通道 /mirachannel/ws 的 relay 帧，分辨率 0.1%
       等价支出    ~/.claude/projects 的 transcript 与 ~/.mirasim/insights 的网关账本
       价目表      ~/.mirasim/models-dev-cache.json，缺失时用内置表
+      速度实测    Claude Code OTel trace（回环 4319 接收），逐请求首 token 与时长
       满额        额度点 × 单价（单价由同期支出 ÷ 已用点数反推）；端点不可读时改由
                   「同期支出 ÷ 百分比增量」反推，样本落在 ~/.miraquota
 
@@ -56,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let engine: QuotaEngine
     /// 客户端内控件的数据源。Mirasim 渲染进程读不到本地账本，只能由这里喂。
     private let feed = Feed()
+    /// Claude Code OTel trace 的接收端，逐请求实测首 token 与时长在此落盘。
+    private let otlp = OtlpReceiver()
     private let injector = Injector()
     private var statusItem: NSStatusItem?
     private var popover: NSPopover!
@@ -90,9 +93,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .applicationDefined
         // 展开动画保留。跟手与否取决于上面的 behavior，与动画无关。
         popover.animates = true
-        // 与三窗口 + 速度卡的实际内容对齐；差得太多时首次展开会有一次可见的尺寸校正。
-        popover.contentSize = NSSize(width: 344, height: 500)
-        popover.contentViewController = NSHostingController(rootView: PanelView(engine: engine))
+        // 尺寸不预设：`NSHostingController` 按 preferredContentSize 报实际内容高度，
+        // 预设一个对不上的值会让首次展开出现一次可见的尺寸校正。
+        let hosting = NSHostingController(rootView: PanelView(engine: engine))
+        hosting.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = hosting
 
         engine.$report
             .receive(on: RunLoop.main)
@@ -107,11 +112,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         feed.onQuit = { NSApplication.shared.terminate(nil) }
         feed.start()
+        otlp.start()
         // 控件注入到 Mirasim 的渲染进程里，数据从上面那个回环接口拉。
         // 客户端里已经有控件时收起菜单栏图标；注入不可用时再放出来，
         // 保证任何时候都至少有一处能看到额度。
         injector.onPresence = { [weak self] inClient in
-            DispatchQueue.main.async { self?.statusItem?.isVisible = !inClient }
+            DispatchQueue.main.async { self?.statusItem?.isVisible = Diag.statusAlways || !inClient }
         }
         injector.start(feed: feed)
 
@@ -123,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         injector.stop()
+        otlp.stop()
         feed.stop()
         engine.stop()
     }
@@ -177,6 +184,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func open(from button: NSStatusBarButton) {
         panelOpen = true
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // 展开后的实际内容尺寸，用于核对排版高度。取值要等一帧布局落定。
+        if Diag.enabled {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self, let size = self.popover.contentViewController?.view.fittingSize else { return }
+                Diag.log("panel size=\(Int(size.width))×\(Int(size.height)) windows=\(self.engine.report.windows.count)")
+            }
+        }
         // 菜单栏的点击经由系统 UI 派发，全局监听同样会收到状态栏按钮自身的点击。
         // 若不排除，监听会先把弹层关掉，随后 toggle 看到「未展开」又重新打开，
         // 结果是按钮永远关不上弹层。故落在按钮范围内的点击一律交给 toggle。

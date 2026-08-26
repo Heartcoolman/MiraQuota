@@ -17,6 +17,9 @@ enum Paths {
     static var anchorState: URL { stateDir.appending(path: "anchor.json") }
     static var feedToken: URL { stateDir.appending(path: "feed.token") }
     static var config: URL { stateDir.appending(path: "config.json") }
+    /// OTLP 接收端落的逐请求实测样本（首 token 与总时长）。
+    static var measuredDir: URL { stateDir.appending(path: "measured") }
+    static var claudeSettings: URL { home.appending(path: ".claude/settings.json") }
 
     static func ensureStateDir() {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
@@ -77,6 +80,8 @@ enum Diag {
     static let forceOffline = ProcessInfo.processInfo.environment["MIRAQUOTA_OFFLINE"] == "1"
     /// 屏蔽 /v1/limits，用于验证退回 relay 帧那一级是否可用。
     static let noLimits = ProcessInfo.processInfo.environment["MIRAQUOTA_NO_LIMITS"] == "1"
+    /// 客户端内已有控件时仍保留菜单栏图标，用于两处同时显示。
+    static let statusAlways = ProcessInfo.processInfo.environment["MIRAQUOTA_STATUS_ALWAYS"] == "1"
     /// 覆盖速度统计的窗口长度（秒），用于验证样本不足时的退化分支。
     static let speedSpan: TimeInterval? = {
         guard let raw = ProcessInfo.processInfo.environment["MIRAQUOTA_SPEED_SPAN"],
