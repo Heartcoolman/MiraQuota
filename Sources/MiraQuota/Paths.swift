@@ -15,6 +15,7 @@ enum Paths {
     static var calibState: URL { stateDir.appending(path: "calibration.json") }
     static var calibLock: URL { stateDir.appending(path: "calibration.lock") }
     static var anchorState: URL { stateDir.appending(path: "anchor.json") }
+    static var accountState: URL { stateDir.appending(path: "account.json") }
     static var feedToken: URL { stateDir.appending(path: "feed.token") }
     static var config: URL { stateDir.appending(path: "config.json") }
     /// OTLP 接收端落的逐请求实测样本（首 token 与总时长）。

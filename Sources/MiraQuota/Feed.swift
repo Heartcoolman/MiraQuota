@@ -240,6 +240,8 @@ final class Feed {
         // 按点数口径折算的已用美元。与 usedPercent、进度条同分母，控件主行用它，
         // spentUSD（本机账本支出）降为副行。
         if let scaled = w.scaledSpentUSD { out["scaledSpentUSD"] = scaled }
+        // 档位窗口的 spentUSD 只含同档位模型的支出，控件据此说明它与全机支出不同口径。
+        if let group = w.modelGroup { out["modelGroup"] = group }
         return out
     }
 
@@ -260,6 +262,7 @@ final class Feed {
                 // 界面只显示过闸门的偏离，阈值由 SpeedRow.notableDrift 统一把关，
                 // 两个显示面不各自定阈值。
                 if let notable = row.notableDrift { r["driftNotable"] = notable }
+                if let group = row.modelGroup { r["modelGroup"] = group }
                 return r
             },
             // 按会话分行，状态栏据此只取本窗口的数据。全部来自实测路径。

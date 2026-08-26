@@ -45,6 +45,13 @@ final class CostLedger {
         var booked: [String: Double]? = nil
         /// 旧版按账本行 id 单独存的网关账目，只在 `load` 里并进 `seen` 与 `booked`。
         var gateway: [String: GatewayEntry]? = nil
+        /// 模型档位分桶，键为 `组名|unix 分钟`。`/v1/limits` 的 modelScoped 窗口
+        /// （实测 `7d_fable`）只计特定模型的用量，其支出必须与全局分开，
+        /// 否则该窗口会挂上全机支出而窗口用量为零。必须是 Optional，理由同 `booked`。
+        var scoped: [String: Double]? = nil
+        /// 组名 → 该组开始分桶的 unix 分钟。桶只存金额、不留模型，启用之前的支出
+        /// 无从回溯，窗口起点早于此值时该组的支出偏低，由 `scopedComplete` 判定。
+        var scopedSince: [String: Int]? = nil
     }
 
     private var state = Persisted()
@@ -63,6 +70,10 @@ final class CostLedger {
     /// 逐次全表扫描并解析字符串键，开销随「样本数 × 桶数」成平方级增长。
     /// 桶变动时置空，下次查询惰性重建。
     private var index: (minutes: [Int], prefix: [Double])?
+    /// 各模型档位组的前缀和，按需构建。
+    private var scopedIndex: [String: (minutes: [Int], prefix: [Double])] = [:]
+    /// 当前需要单独分桶的模型档位组，小写。取自 `/v1/limits` 的 modelScoped 窗口名。
+    private var scopedGroups: [String] = []
 
     private(set) var transcriptRecords = 0
     private(set) var ledgerRecords = 0
@@ -255,19 +266,19 @@ final class CostLedger {
             return
         }
         guard let rid = requestId else {
-            add(minute: minute, usd: usd)
+            add(minute: minute, usd: usd, model: model)
             transcriptRecords += 1
             return
         }
         if let prior = state.booked?[rid] {
             guard usd > prior else { return }
-            add(minute: state.seen[rid] ?? minute, usd: usd - prior)
+            add(minute: state.seen[rid] ?? minute, usd: usd - prior, model: model)
             state.booked?[rid] = usd
             return
         }
         state.seen[rid] = minute
         state.booked?[rid] = usd
-        add(minute: minute, usd: usd)
+        add(minute: minute, usd: usd, model: model)
         transcriptRecords += 1
     }
 
@@ -309,13 +320,13 @@ final class CostLedger {
         if let prior {
             guard usd > prior else { return false }
             // 回填把金额补大了：差额记回首见的分钟，桶归属不漂移。
-            add(minute: state.seen[key] ?? epoch / 60, usd: usd - prior)
+            add(minute: state.seen[key] ?? epoch / 60, usd: usd - prior, model: model)
             state.booked?[key] = usd
         } else {
             let minute = epoch / 60
             state.seen[key] = minute
             state.booked?[key] = usd
-            add(minute: minute, usd: usd)
+            add(minute: minute, usd: usd, model: model)
             if countedLedger.insert(id).inserted { ledgerRecords += 1 }
         }
         return true
@@ -329,16 +340,55 @@ final class CostLedger {
     }
 
     @inline(__always)
-    private func add(minute: Int, usd: Double) {
+    private func add(minute: Int, usd: Double, model: String = "") {
         let key = String(minute)
         state.buckets[key, default: 0] += usd
         index = nil
+        guard !scopedGroups.isEmpty, !model.isEmpty else { return }
+        let lower = model.lowercased()
+        for group in scopedGroups where lower.contains(group) {
+            state.scoped?[group + "|" + key, default: 0] += usd
+            scopedIndex[group] = nil
+        }
+    }
+
+    /// 声明需要单独分桶的模型档位组。组名取自 modelScoped 窗口名下划线之后的部分
+    /// （`7d_fable` → `fable`），模型名含该子串即归入该组。
+    /// 新组从声明时刻起累积：桶只存金额，此前的支出无从追认。
+    func adoptScopedGroups(_ groups: [String]) {
+        let normalized = groups.map { $0.lowercased() }.filter { !$0.isEmpty }.sorted()
+        guard normalized != scopedGroups else { return }
+        scopedGroups = normalized
+        if state.scoped == nil { state.scoped = [:] }
+        var since = state.scopedSince ?? [:]
+        let now = Int(Date().timeIntervalSince1970) / 60
+        var dirty = false
+        for group in normalized where since[group] == nil {
+            since[group] = now
+            dirty = true
+        }
+        if dirty {
+            state.scopedSince = since
+            save()
+        }
+    }
+
+    /// 该组的分桶是否已覆盖到给定时刻。未覆盖时其支出偏低，展示需据此让位。
+    func scopedComplete(group: String, from: Date) -> Bool {
+        guard let since = state.scopedSince?[group.lowercased()] else { return false }
+        return since <= Int(from.timeIntervalSince1970) / 60
     }
 
     private func prune(cutoff: Int) {
         let minCutoff = cutoff / 60
         let before = state.buckets.count
         state.buckets = state.buckets.filter { (Int($0.key) ?? 0) >= minCutoff }
+        if let scoped = state.scoped {
+            state.scoped = scoped.filter { key, _ in
+                (key.split(separator: "|").last.flatMap { Int($0) } ?? 0) >= minCutoff
+            }
+            scopedIndex.removeAll()
+        }
         state.seen = state.seen.filter { $0.value >= minCutoff }
         // 金额账目与 seen 同生共死：键一致，靠 seen 的分钟判龄。
         state.booked = state.booked.map { $0.filter { state.seen[$0.key] != nil } }
@@ -357,22 +407,43 @@ final class CostLedger {
     /// `includeOpenMinute` 把 `to` 所在的未完整分钟桶一并计入：展示路径以 now 为
     /// 上界，不含它会让刚落账的请求最多 60 秒不可见。标定的逐对查询不可用——
     /// 相邻样本对的半开分钟区间恰好平铺，计入开分钟会让边界分钟被两对重复计。
-    func spent(from: Date, to: Date, includeOpenMinute: Bool = false) -> Double {
-        if index == nil { buildIndex() }
-        guard let index, !index.minutes.isEmpty else { return 0 }
-        let lo = lowerBound(index.minutes, Int(from.timeIntervalSince1970) / 60)
-        let hi = lowerBound(index.minutes,
+    /// `group` 给定时只计该模型档位组的支出，用于 modelScoped 窗口。
+    func spent(from: Date, to: Date, includeOpenMinute: Bool = false,
+               group: String? = nil) -> Double {
+        let table: (minutes: [Int], prefix: [Double])?
+        if let group = group?.lowercased() {
+            if scopedIndex[group] == nil { buildScopedIndex(group) }
+            table = scopedIndex[group]
+        } else {
+            if index == nil { buildIndex() }
+            table = index
+        }
+        guard let table, !table.minutes.isEmpty else { return 0 }
+        let lo = lowerBound(table.minutes, Int(from.timeIntervalSince1970) / 60)
+        let hi = lowerBound(table.minutes,
                             Int(to.timeIntervalSince1970) / 60 + (includeOpenMinute ? 1 : 0))
-        return index.prefix[hi] - index.prefix[lo]
+        return table.prefix[hi] - table.prefix[lo]
     }
 
     private func buildIndex() {
-        let sorted = state.buckets
-            .compactMap { key, value in Int(key).map { ($0, value) } }
-            .sorted { $0.0 < $1.0 }
+        index = Self.prefixSums(state.buckets.compactMap { key, value in
+            Int(key).map { ($0, value) }
+        })
+    }
+
+    private func buildScopedIndex(_ group: String) {
+        let head = group + "|"
+        scopedIndex[group] = Self.prefixSums((state.scoped ?? [:]).compactMap { key, value in
+            guard key.hasPrefix(head), let minute = Int(key.dropFirst(head.count)) else { return nil }
+            return (minute, value)
+        })
+    }
+
+    private static func prefixSums(_ entries: [(Int, Double)]) -> (minutes: [Int], prefix: [Double]) {
+        let sorted = entries.sorted { $0.0 < $1.0 }
         var prefix = [Double](repeating: 0, count: sorted.count + 1)
         for (i, entry) in sorted.enumerated() { prefix[i + 1] = prefix[i] + entry.1 }
-        index = (sorted.map { $0.0 }, prefix)
+        return (sorted.map { $0.0 }, prefix)
     }
 
     /// 首个不小于 target 的下标。

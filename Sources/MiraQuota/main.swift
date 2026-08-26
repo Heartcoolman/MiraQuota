@@ -22,8 +22,8 @@ if arguments.contains("--help") || arguments.contains("-h") {
       等价支出    ~/.claude/projects 的 transcript 与 ~/.mirasim/insights 的网关账本
       价目表      ~/.mirasim/models-dev-cache.json，缺失时用内置表
       速度实测    Claude Code OTel trace（回环 4319 接收），逐请求首 token 与时长
-      满额        额度点 × 单价（单价由同期支出 ÷ 已用点数反推）；端点不可读时改由
-                  「同期支出 ÷ 百分比增量」反推，样本落在 ~/.miraquota
+      满额        标定优先：「同期支出 ÷ 同期点数增量 × 预算点」，样本落在 ~/.miraquota；
+                  端点不可读时退回百分比口径；标定未收敛时才用全局单价 × 预算点兜底
 
     通道不可用时按五级阶梯退让，任何一级都仍有输出：
       精确 → 实时 → 过期实测 → 锚点推算（Mirasim 关闭也可用）→ 本地滚动窗口

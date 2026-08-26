@@ -69,6 +69,12 @@ final class SpeedStats {
     private static let minStreamSeconds = 0.25
     /// 实测对照保留的事件数。
     private static let measuredKeep = 20
+    /// 实测样本比账本样本旧过这个时长即改走回归。实测通道会整段中断
+    /// （未注入 OTel env 的会话不上报），此时它的样本停在断点不再前进，
+    /// 而账本仍在记录新请求；不比新旧一律优先实测，卡片会定格在断点时刻
+    /// （实测停在 23:10、账本已到 00:28，界面显示「77 分钟前」不动）。
+    /// 容差取 10 分钟，覆盖 OTLP 导出的批处理延迟，不至于逐轮翻转。
+    private static let measuredStaleGap = 600
 
     private var samples: [Sample] = []
     /// 在途请求：callId → 开始时刻（epoch 秒）。begin 事件在请求发出瞬间落盘，
@@ -96,6 +102,24 @@ final class SpeedStats {
     /// 否则偏离贴着阈值时提示会逐轮出现与消失（实测 -32% 一段里仍闪了一次）。
     private var driftShown: Set<String> = []
 
+    /// 样本的时间下界，unix 秒，0 表示不设界。换账号后切换前的请求不再可比：
+    /// 上游账号池随之更换，出字速度与首 token 都可能整体平移，而回归与「较常态」
+    /// 取的是保留期内的全部样本，混算会让两天之内的对照都失真。
+    private var epochStart = 0
+
+    /// 当前套餐档位的可用样本区间。同账号内换档位时预算点与上游服务质量都会变，
+    /// 首 token 与出字速度可能整体平移，故按档位分组：区间之外的样本属于别的档位，
+    /// 不参与本档位的估计，切回原档位时其历史样本照常复用。
+    private var planWindows: PlanWindows = .unbounded
+
+    /// 额度档位组，用于把速度行与 modelScoped 窗口对上。取自 `/v1/limits` 的窗口名。
+    private var scopedGroups: [String] = []
+
+    /// 上一轮账本扫描读到的字节数、含预筛针的行数与真正成样本的行数。
+    /// 三者一路收窄，卡在哪一段即定位到是没读到、没过预筛，还是解析被条件挡下。
+    private(set) var lastScan: (bytes: Int, lines: Int, parsed: Int,
+                               cutoff: Int, rejected: [String: Int]) = (0, 0, 0, 0, [:])
+
     /// 实测样本，按 requestId 去重：导出器至少送达一次，重试会产生重复行。
     private var otlpSamples: [String: MeasuredSample] = [:]
     private var measuredCursors: [String: Int] = [:]
@@ -106,10 +130,32 @@ final class SpeedStats {
     private static let modelEventNeedle = Array("\"kind\":\"model.".utf8)
     private static let usageNeedle = Array("\"usage\"".utf8)
 
+    /// 下界在此读入而非由调用方注入：`--doctor` 与常驻是两个进程、各自建一份，
+    /// 只在常驻的启动路径上设界会让自检报出切换前的数字。
+    init() {
+        let accounts = AccountStore()
+        epochStart = Int(accounts.since)
+        planWindows = accounts.currentWindows()
+    }
+
+    /// 声明额度档位组。速度按模型分行已有，此处只是给每行标出它归属哪个档位窗口，
+    /// 不改变分行方式：同档位可有多个模型，档位窗口计的是它们的总用量。
+    func adoptScopedGroups(_ groups: [String]) {
+        scopedGroups = groups.map { $0.lowercased() }.filter { !$0.isEmpty }.sorted()
+    }
+
+    private func scopedGroup(for model: String) -> String? {
+        let lower = model.lowercased()
+        return scopedGroups.first { lower.contains($0) }
+    }
+
     // MARK: 采集
 
     func refresh(now: Date = Date()) {
-        let cutoff = Int(now.addingTimeInterval(-Self.retention).timeIntervalSince1970)
+        // 扫描下界取三者最晚：保留期、换账号时刻、当前档位最早的可用区间。
+        // 档位区间之外的样本不会进入估计，扫回来只是占内存。
+        let cutoff = max(Int(now.addingTimeInterval(-Self.retention).timeIntervalSince1970),
+                         max(epochStart, Int(planWindows.earliest)))
         scanLedger(cutoff: cutoff)
         scanAnalytics()
         scanDiag()
@@ -145,6 +191,8 @@ final class SpeedStats {
                                                      includingPropertiesForKeys: [.fileSizeKey]) else { return }
         var seen: [String: Sample] = [:]
         for s in samples { seen[s.id] = s }
+        var scanBytes = 0, scanLines = 0, scanParsed = 0
+        var rejected: [String: Int] = [:]
 
         for file in files where file.lastPathComponent.hasPrefix("usage-") && file.pathExtension == "ndjson" {
             let attrs = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
@@ -159,6 +207,7 @@ final class SpeedStats {
             let offset = max(0, size - Self.rescanWindow)
             try? handle.seek(toOffset: UInt64(offset))
             guard let data = try? handle.readToEnd(), !data.isEmpty else { continue }
+            scanBytes += data.count
             // 起点可能落在半行中间，跳过第一行。
             let skipFirst = offset > 0
             data.withUnsafeBytes { raw in
@@ -172,10 +221,15 @@ final class SpeedStats {
                         guard bytes[i] == 0x0A else { i += 1; continue }
                         let length = i - start
                         if !(skipFirst && firstLine), length > 2,
-                           memmem(bytes + start, length, pat.baseAddress, pat.count) != nil,
-                           let sample = Self.parseUsage(Data(bytes: bytes + start, count: length),
-                                                        cutoff: cutoff) {
-                            seen[sample.id] = sample
+                           memmem(bytes + start, length, pat.baseAddress, pat.count) != nil {
+                            scanLines += 1
+                            let row = Data(bytes: bytes + start, count: length)
+                            if let sample = Self.parseUsage(row, cutoff: cutoff) {
+                                scanParsed += 1
+                                seen[sample.id] = sample
+                            } else {
+                                rejected[Self.rejectReason(row, cutoff: cutoff), default: 0] += 1
+                            }
                         }
                         firstLine = false
                         start = i + 1
@@ -185,6 +239,7 @@ final class SpeedStats {
             }
         }
         samples = seen.values.sorted { $0.at < $1.at }
+        lastScan = (scanBytes, scanLines, scanParsed, cutoff, rejected)
     }
 
     private func scanAnalytics() {
@@ -272,10 +327,36 @@ final class SpeedStats {
         }
     }
 
+    /// 设定样本归属。启动时按落盘的状态调用一次，观测到换账号或换档位时再调用一次。
+    ///
+    /// 换账号丢弃切换前的样本：旧账号的数据不再保留。换档位只换过滤区间，
+    /// 各档位的样本各自留着，切回原档位即复用。两种情形都清掉平滑与迟滞状态：
+    /// 它们存的是变更前的显示值，留着会让第一条新样本被按旧值平滑，
+    /// 或直接触发一次无实质变化的「较常态」提示。整轮首字节只存取值、不留时刻，
+    /// 无从按区间筛，一并清空后由后续事件重新累积。
+    func adopt(epochStart: Double, planWindows: PlanWindows) {
+        let bound = Int(epochStart)
+        let boundMoved = bound > self.epochStart
+        let windowsMoved = planWindows != self.planWindows
+        guard boundMoved || windowsMoved else { return }
+        if boundMoved {
+            self.epochStart = bound
+            samples.removeAll { $0.at < bound }
+            otlpSamples = otlpSamples.filter { $0.value.at >= bound }
+        }
+        self.planWindows = planWindows
+        measured.removeAll()
+        shownRate.removeAll()
+        driftShown.removeAll()
+    }
+
     /// token 与时长的下限在这里统一把关：账本落盘时 token 为 0，
-    /// 预筛已挪后，凡进入估计的样本都必须过这道门。
+    /// 预筛已挪后，凡进入估计的样本都必须过这道门。档位区间一并在此设限。
     private var usable: [Sample] {
-        samples.filter { $0.out >= Self.minOutput && $0.ms >= Self.minDuration }
+        samples.filter {
+            $0.out >= Self.minOutput && $0.ms >= Self.minDuration
+                && planWindows.contains(Double($0.at))
+        }
     }
 
     private func scanTranscripts(for wanted: Set<String>) {
@@ -419,12 +500,31 @@ final class SpeedStats {
                       requestId: (root["providerCallId"] as? String) ?? "")
     }
 
+    /// 被 `parseUsage` 挡下的原因，供自检定位。只在诊断路径上调用。
+    private static func rejectReason(_ line: Data, cutoff: Int) -> String {
+        guard let root = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
+        else { return "json" }
+        guard (root["status"] as? Int) == 200 else { return "status" }
+        guard let ts = root["ts"] as? String else { return "ts" }
+        guard let at = fastEpochSeconds(ts) else { return "ts格式" }
+        guard at >= cutoff else { return "早于下界" }
+        guard int(root["durationMs"]) != nil else { return "时长" }
+        guard let model = root["model"] as? String, !model.isEmpty else { return "模型" }
+        return "其他"
+    }
+
     /// Mirasim 自己测的整轮首字节。口径是整轮而非单次请求，只作量级对照。
     private func parseTurn(_ line: Data) {
         guard let root = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               (root["name"] as? String) == "turn.finish",
               let props = root["props"] as? [String: Any],
               let ttfb = Self.int(props["ttfbMs"]), ttfb > 0 else { return }
+        // 与逐次样本同界。这里按事件自带的 ts 判断，不能靠 `adopt` 清空了事：
+        // 事件文件在磁盘上，游标只在内存里，重启后整份文件会被重读一遍。
+        if epochStart > 0 || !planWindows.spans.isEmpty {
+            guard let ts = root["ts"] as? String, let at = fastEpochSeconds(ts),
+                  at >= epochStart, planWindows.contains(Double(at)) else { return }
+        }
         measured.append(Double(ttfb) / 1000)
     }
 
@@ -435,12 +535,24 @@ final class SpeedStats {
         return nil
     }
 
+    /// 供自检使用：回归池的规模。`total` 是保留期内通过门槛的样本数，
+    /// `recent` 是落在近期窗口内的部分，`latest` 是最新一条的时刻。
+    /// 两者差得远说明扫描或区间过滤把样本挡在了外面。
+    var poolStats: (total: Int, recent: Int, latest: Date?, raw: Int) {
+        let pool = usable
+        let fresh = Int(Date().addingTimeInterval(-(Diag.speedSpan ?? Self.recencyLimit))
+                            .timeIntervalSince1970)
+        return (pool.count, pool.filter { $0.at >= fresh }.count,
+                pool.map(\.at).max().map { Date(timeIntervalSince1970: Double($0)) },
+                samples.count)
+    }
+
     // MARK: 估计
 
     /// 按模型给出「最近几次」的速度。两路样本都空时返回 nil，界面据此整卡隐藏。
     func report(now: Date = Date()) -> SpeedReport? {
         let pool = usable
-        let mPool = Array(otlpSamples.values)
+        let mPool = otlpSamples.values.filter { planWindows.contains(Double($0.at)) }
         guard !pool.isEmpty || !mPool.isEmpty || !flights.isEmpty else { return nil }
         let horizon = Diag.speedSpan ?? Self.recencyLimit
         let fresh = Int(now.addingTimeInterval(-horizon).timeIntervalSince1970)
@@ -452,10 +564,19 @@ final class SpeedStats {
 
         // 实测行优先。经 4977/4979 的请求账本里也有记录，两条路径描述同一批
         // 请求，只择一不叠加；Mirasim 派生会话不发 OTel，回归是它们唯一的路。
+        // 实测明显落后于账本时反序：那是实测通道断了，见 `measuredStaleGap`。
         let rows = Set(byModel.keys).union(measuredByModel.keys)
-            .compactMap { model in
-                measuredEstimate(measuredByModel[model] ?? [], fresh: fresh)
-                    ?? estimate(byModel[model] ?? [], fresh: fresh)
+            .compactMap { model -> SpeedRow? in
+                let byRegression = byModel[model] ?? []
+                let byMeasure = measuredByModel[model] ?? []
+                let lagging = (byRegression.map(\.at).max() ?? 0)
+                    - (byMeasure.map(\.at).max() ?? 0) > Self.measuredStaleGap
+                if lagging {
+                    return estimate(byRegression, fresh: fresh)
+                        ?? measuredEstimate(byMeasure, fresh: fresh)
+                }
+                return measuredEstimate(byMeasure, fresh: fresh)
+                    ?? estimate(byRegression, fresh: fresh)
             }
             .sorted { $0.latestAt > $1.latestAt }
             .prefix(3)
@@ -518,7 +639,8 @@ final class SpeedStats {
         var row = SpeedRow(model: key, samples: recent.count,
                            ttft: ttft, rate: rate, endToEnd: endToEnd,
                            baselineRate: baselineRate,
-                           latestAt: Date(timeIntervalSince1970: Double(newest.at)))
+                           latestAt: Date(timeIntervalSince1970: Double(newest.at)),
+                           modelGroup: scopedGroup(for: newest.model))
         row.notableDrift = row.driftPasses(shown: driftShown.contains(key))
         if row.notableDrift == nil { driftShown.remove(key) } else { driftShown.insert(key) }
         return row
@@ -566,7 +688,8 @@ final class SpeedStats {
         var row = SpeedRow(model: key, samples: recent.count,
                            ttft: ttft, rate: rate, endToEnd: endToEnd,
                            baselineRate: baselineRate,
-                           latestAt: Date(timeIntervalSince1970: Double(newest.at)))
+                           latestAt: Date(timeIntervalSince1970: Double(newest.at)),
+                           modelGroup: scopedGroup(for: newest.model))
         row.measured = true
         row.notableDrift = row.driftPasses(shown: driftShown.contains(key))
         if row.notableDrift == nil { driftShown.remove(key) } else { driftShown.insert(key) }

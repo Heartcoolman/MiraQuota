@@ -7,9 +7,17 @@ struct LimitsSnapshot: Sendable {
         let used: Double
         let budget: Double
         let resetAt: Date
+        /// 该窗口是否只计特定模型档位的用量（实测 `7d_fable`）。
+        /// 这类窗口的等价支出须按同一档位过滤，否则会挂上全机支出。
+        var modelScoped: Bool = false
 
         var usedPercent: Double { budget > 0 ? min(100, used / budget * 100) : 0 }
-        var quotaWindow: QuotaWindow { QuotaWindow(label: label, usedPercent: usedPercent, resetAt: resetAt) }
+        /// 模型档位组名，取窗口名下划线之后的部分。非 modelScoped 窗口为 nil。
+        var modelGroup: String? { modelScoped ? QuotaWindow.modelGroup(of: label) : nil }
+        var quotaWindow: QuotaWindow {
+            QuotaWindow(label: label, usedPercent: usedPercent, resetAt: resetAt,
+                        modelScoped: modelScoped)
+        }
     }
 
     let windows: [Window]
@@ -48,6 +56,9 @@ final class LimitsClient {
 
     private let lock = NSLock()
     private var cachedPort: Int?
+    /// 该端口配对的会话令牌。新版 Mirasim 的路由端口对 `/v1/limits` 也要求
+    /// `x-api-key`，令牌随会话存亡，故与端口一同缓存、一同失效。
+    private var cachedToken: String?
     private var last: LimitsSnapshot?
     private var lastAttempt = Date.distantPast
     private var discoveryFailedAt = Date.distantPast
@@ -67,18 +78,23 @@ final class LimitsClient {
         }
         lastAttempt = now
         let port = cachedPort
+        let token = cachedToken
         let quietUntil = discoveryFailedAt.addingTimeInterval(Self.rediscoverAfter)
         lock.unlock()
 
         if Diag.forceOffline || Diag.noLimits { return nil }
 
-        var found = port.flatMap { Self.fetch(port: $0) }
+        var found = port.flatMap { Self.fetch(port: $0, token: token) }
         if found == nil, now.timeIntervalSince(quietUntil) >= 0 {
             let candidates = Self.routerPorts(anchor: anchorPort)
+            let tokens = candidates.isEmpty ? [:] : Self.sessionTokens()
             for candidate in candidates where candidate != port {
-                if let s = Self.fetch(port: candidate) {
+                if let s = Self.fetch(port: candidate, token: tokens[candidate]) {
                     found = s
-                    lock.lock(); cachedPort = candidate; lock.unlock()
+                    lock.lock()
+                    cachedPort = candidate
+                    cachedToken = tokens[candidate]
+                    lock.unlock()
                     break
                 }
             }
@@ -93,7 +109,12 @@ final class LimitsClient {
         }
 
         lock.lock()
-        if found == nil { cachedPort = nil } else { endpointConfirmed = true }
+        if found == nil {
+            cachedPort = nil
+            cachedToken = nil
+        } else {
+            endpointConfirmed = true
+        }
         last = found
         lock.unlock()
         return found
@@ -104,6 +125,7 @@ final class LimitsClient {
     func invalidate() {
         lock.lock()
         cachedPort = nil
+        cachedToken = nil
         last = nil
         discoveryFailedAt = .distantPast
         lastAttempt = .distantPast
@@ -118,10 +140,13 @@ final class LimitsClient {
 
     // MARK: 取值
 
-    private static func fetch(port: Int) -> LimitsSnapshot? {
+    private static func fetch(port: Int, token: String?) -> LimitsSnapshot? {
         guard let url = URL(string: "http://127.0.0.1:\(port)/v1/limits") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
+        // 早期版本对本机免认证，新版按普通 API 请求鉴权。带上令牌两版都能过：
+        // 免认证的那版不看这个头。
+        if let token { request.setValue(token, forHTTPHeaderField: "x-api-key") }
         var payload: Data?
         let done = DispatchSemaphore(value: 0)
         URLSession.shared.dataTask(with: request) { data, response, _ in
@@ -146,8 +171,10 @@ final class LimitsClient {
             // 已用金额静默显示 $0 且不触发任何降级。
             if reset > 1e11 { reset /= 1000 }
             guard reset > now - 86400, reset < now + 30 * 86400 else { return nil }
+            let scoped = (w["model_scoped"] as? Bool) ?? (w["modelScoped"] as? Bool) ?? false
             return LimitsSnapshot.Window(label: name, used: used, budget: budget,
-                                         resetAt: Date(timeIntervalSince1970: reset))
+                                         resetAt: Date(timeIntervalSince1970: reset),
+                                         modelScoped: scoped)
         }
         guard !windows.isEmpty else { return nil }
         return LimitsSnapshot(windows: windows, capturedAt: Date(),
@@ -199,6 +226,34 @@ final class LimitsClient {
         }
         // mirachannel 那个端口回的是首页 HTML，放到最后再试。
         return Array(Set(ports)).sorted { a, b in (a == homePort ? 1 : 0) < (b == homePort ? 1 : 0) }
+    }
+
+    /// 路由端口 → 会话令牌。令牌不落盘，只在 Mirasim 拉起的会话进程环境里：
+    /// 同一进程的 `ANTHROPIC_BASE_URL` 指向哪个回环端口，`ANTHROPIC_AUTH_TOKEN`
+    /// 就是那个端口的令牌。会话退出后端口与令牌一并消失，故每轮发现都重新读。
+    ///
+    /// `ps` 必须用 `-U` 限定用户：BSD 语法下不给选择符时只列「同用户且同控制终端」的
+    /// 进程，LaunchAgent 没有控制终端，结果会是空的。
+    static func sessionTokens() -> [Int: String] {
+        guard let text = run("/bin/ps", ["eww", "-U", NSUserName(), "-o", "command="]) else { return [:] }
+
+        let urlPrefix = "ANTHROPIC_BASE_URL=http://127.0.0.1:"
+        var map: [Int: String] = [:]
+        for line in text.split(separator: "\n") {
+            var port: Int?
+            var token: String?
+            // 逐个环境项精确匹配前缀：同一行还有 `MIRASIM_PTY_PIN_ANTHROPIC_BASE_URL`
+            // 这类同名后缀的变量，子串匹配会配错。
+            for field in line.split(separator: " ") {
+                if field.hasPrefix(urlPrefix) {
+                    port = Int(field.dropFirst(urlPrefix.count).prefix { $0.isNumber })
+                } else if field.hasPrefix("ANTHROPIC_AUTH_TOKEN=") {
+                    token = String(field.dropFirst("ANTHROPIC_AUTH_TOKEN=".count))
+                }
+            }
+            if let port, let token, !token.isEmpty { map[port] = token }
+        }
+        return map
     }
 
     private static func mirasimPIDs() -> [Int] {

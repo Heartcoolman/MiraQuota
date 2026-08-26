@@ -87,6 +87,7 @@ enum Doctor {
                      fix: "本地模式下额度由自有 Anthropic 账号计量，不经 relay")
             }
             line(.ok, "线路", "\(s.mode) \(s.host) · \(s.relayStatus)")
+            checkAccount(s)
             if !s.history.isEmpty {
                 line(.ok, "历史缓冲", "\(s.history.count) 点，可用于冷启动补样本")
             }
@@ -107,6 +108,24 @@ enum Doctor {
         return found
     }
 
+    /// 账号身份与套餐，以及落盘的切换时刻。判据只认 `login.userId`：
+    /// 令牌尾号约每小时轮换一次，拿它当判据会把轮换判成换账号。
+    private static func checkAccount(_ s: RelaySnapshot) {
+        let plan = s.plan.map { "套餐 \($0)" } ?? "套餐未知"
+        let store = AccountStore()
+        let since = store.since
+        let when = since > 0
+            ? " · 上次切换 " + Self.stamp.string(from: Date(timeIntervalSince1970: since))
+            : " · 未观测到切换"
+        guard s.accountTag != nil else {
+            line(.warn, "账号", "\(plan) · 本帧无 login.userId\(when)",
+                 fix: "该帧不参与账号判定，状态沿用上一次；若所有帧都缺此字段，"
+                    + "换账号将无从识别，切换后旧账号的速度与标定样本会混入")
+            return
+        }
+        line(.ok, "账号", "\(plan) · 判据 userId\(when)")
+    }
+
     /// 路由端口上的 `/v1/limits`。取不到不算失败：旧版 Mirasim 没有这个端点，
     /// 插件会退回 relay 帧的百分比。
     private static var limits: LimitsSnapshot?
@@ -114,8 +133,13 @@ enum Doctor {
     private static func checkLimits(frame: RelaySnapshot?, anchorPort: Int?) {
         let client = LimitsClient()
         guard let snapshot = client.snapshot(anchorPort: anchorPort) else {
-            line(.warn, "额度原始值", "Mirasim 持有的回环端口上均无 /v1/limits",
-                 fix: "旧版 Mirasim 无该端点；插件退回 relay 帧的百分比（分辨率 0.1%）")
+            let tokens = LimitsClient.sessionTokens().count
+            line(.warn, "额度原始值", "Mirasim 持有的回环端口上均无可读的 /v1/limits",
+                 fix: tokens == 0
+                     ? "新版路由端口要求会话令牌，令牌只存在于 Mirasim 拉起的会话进程里；"
+                       + "当前没有这样的会话，插件退回 relay 帧的百分比（分辨率 0.1%）"
+                     : "会话令牌有 \(tokens) 份但都不被接受，或这版 Mirasim 没有该端点；"
+                       + "插件退回 relay 帧的百分比（分辨率 0.1%）")
             return
         }
         limits = snapshot
@@ -166,17 +190,52 @@ enum Doctor {
         }
 
         let calibrator = Calibrator()
-        for label in ["5h", "7d"] {
-            let dump = calibrator.debugDump(label: label, ledger: ledger)
-            line(.ok, "标定 \(label)", dump.replacingOccurrences(of: "\(label): ", with: ""))
+        // 窗口取自端点而非写死 5h/7d：modelScoped 窗口随账号档位增减，
+        // 写死会漏掉它们的标定，而它们正是最容易把全机支出错挂上去的那一类。
+        let labels = limits.map { $0.windows.map(\.label) } ?? ["5h", "7d"]
+        for label in labels {
+            let window = limits?.window(label)
+            let group = window?.modelGroup
+            let dump = calibrator.debugDump(label: label, ledger: ledger,
+                                            budget: window?.budget, group: group)
+            let points = calibrator.pointSampleCount(label: label)
+            let scope = group.map { " 档位 \($0)" } ?? ""
+            line(.ok, "标定 \(label)",
+                 dump.replacingOccurrences(of: "\(label): ", with: "")
+                    + "  点数样本 \(points)" + scope)
         }
 
-        if let limits { checkUnitPrice(limits, ledger: ledger, calibrator: calibrator) }
+        if let limits {
+            checkScopedWindows(limits, ledger: ledger)
+            checkUnitPrice(limits, ledger: ledger, calibrator: calibrator)
+        }
 
         checkSpeed()
     }
 
-    /// 额度点单价，以及它与回归标定的互校。两条路径互相独立，差得多说明其中一条有问题。
+    /// 模型档位窗口的支出口径。这类窗口只累计特定档位的模型用量，配上全机支出会
+    /// 把每点美元抬高数十倍；账本另开一路分桶，但桶只存金额、不留模型，
+    /// 声明该档位之前的支出无从追认，窗口起点早于声明时刻时其支出偏低。
+    private static func checkScopedWindows(_ limits: LimitsSnapshot, ledger: CostLedger) {
+        let now = Date()
+        for w in limits.windows {
+            guard let group = w.modelGroup else { continue }
+            let start = w.quotaWindow.startAt
+            let scoped = start.map {
+                ledger.spent(from: $0, to: now, includeOpenMinute: true, group: group)
+            } ?? 0
+            let all = start.map { ledger.spent(from: $0, to: now, includeOpenMinute: true) } ?? 0
+            let complete = start.map { ledger.scopedComplete(group: group, from: $0) } ?? false
+            let detail = String(format: "档位 %@ · 本档位支出 $%.2f · 同窗口全机支出 $%.2f · %.0f 点",
+                                group, scoped, all, w.used)
+            line(complete ? .ok : .warn, "档位窗口 \(w.label)", detail,
+                 fix: complete ? nil
+                     : "分桶自声明该档位起累积，窗口起点早于声明时刻，本档位支出偏低")
+        }
+    }
+
+    /// 额度点单价，以及它与标定的对照。单价恒由已用点数最多的窗口（通常 7d）反推，
+    /// 故该窗口上两者是同一个式子、必然吻合；其余窗口的差值反映的是跨窗口挪用单价的偏差。
     private static func checkUnitPrice(_ limits: LimitsSnapshot, ledger: CostLedger, calibrator: Calibrator) {
         let now = Date()
         var best: (label: String, points: Double, usd: Double)?
@@ -196,17 +255,29 @@ enum Doctor {
              String(format: "$%.6f/点（按 %@ 窗口 %.0f 点 / $%.2f 反推）", price, best.label, best.points, best.usd))
         for w in limits.windows {
             let fromPoints = price * w.budget
-            guard let regression = calibrator.estimate(label: w.label, ledger: ledger)?.fullUSD else { continue }
-            let gap = abs(fromPoints - regression) / fromPoints * 100
-            line(gap <= 15 ? .ok : .warn, "满额互校 \(w.label)",
-                 String(format: "额度点口径 $%.0f · 回归标定 $%.0f · 差 %.1f%%", fromPoints, regression, gap),
-                 fix: gap > 15 ? "两条独立路径分歧超过 15%，检查账本是否漏记、标定样本是否跨窗口" : nil)
+            guard let e = calibrator.estimate(label: w.label, ledger: ledger, budget: w.budget)
+            else { continue }
+            let gap = abs(fromPoints - e.fullUSD) / fromPoints * 100
+            // 「同式」只在该窗口既是单价来源、标定又走百分比口径时成立：
+            // 那时两边都是「同期支出 ÷ 同期用量比例」。点数口径按逐对配对取样，
+            // 与单价的「窗口累计支出 ÷ 累计点数」不是同一个式子，仍有对照价值。
+            let sameSource = w.label == best.label && e.basis == .percent
+            let detail = String(format: "全局单价口径 $%.0f · 标定 $%.0f（%@） · 差 %.1f%%",
+                                fromPoints, e.fullUSD, e.basis.label, gap)
+            if sameSource {
+                line(.ok, "满额对照 \(w.label)", detail + " · 单价由本窗口反推，同式")
+            } else {
+                line(gap <= 30 ? .ok : .warn, "满额对照 \(w.label)", detail,
+                     fix: gap > 30 ? "跨窗口挪用单价的常态偏差在 10–15%，超过 30% 需查账本漏记或标定样本跨预算点变更" : nil)
+            }
         }
     }
 
     /// 速度估计只依赖网关账本，不需要 relay，故单独验一遍。
     private static func checkSpeed() {
         let stats = SpeedStats()
+        // 档位组来自端点，取不到时速度行不标档位，其余照常。
+        if let limits { stats.adoptScopedGroups(limits.windows.compactMap(\.modelGroup)) }
         stats.refresh()
         guard let report = stats.report() else {
             line(.warn, "速度样本", "\(Paths.mirasimInsights.path) 内无可用记录",
@@ -223,9 +294,21 @@ enum Doctor {
             let rate = row.rate.map { String(format: "%.0f tok/s", $0) } ?? String(format: "端到端 %.0f tok/s", row.endToEnd)
             let drift = row.drift.map { String(format: " 较常态 %+.0f%%", $0) } ?? ""
             let age = Formatting.age(Date().timeIntervalSince(row.latestAt))
-            return "\(row.model)[\(row.measured ? "实测" : "回归")] \(ttft) · \(rate) · 最近 \(row.samples) 次 · \(age)前\(drift)"
+            let scope = row.modelGroup.map { "@\($0)" } ?? ""
+            return "\(row.model)\(scope)[\(row.measured ? "实测" : "回归")] \(ttft) · \(rate)"
+                + " · 最近 \(row.samples) 次 · \(age)前\(drift)"
         }.joined(separator: " · ")
         line(.ok, "速度样本", desc)
+        let pool = stats.poolStats
+        let poolAge = pool.latest.map { Formatting.age(Date().timeIntervalSince($0)) + "前" } ?? "-"
+        let scan = stats.lastScan
+        let why = scan.rejected.sorted { $0.value > $1.value }
+            .prefix(3).map { "\($0.key) \($0.value)" }.joined(separator: " / ")
+        line(.ok, "回归池",
+             "扫入 \(scan.bytes / 1024) KB / \(scan.lines) 行 → 成样本 \(scan.parsed) 条"
+                + (why.isEmpty ? "" : "（挡下 \(why)）")
+                + " · 池 \(pool.raw) 条 · 过门槛 \(pool.total) 条"
+                + " · 近期窗口内 \(pool.recent) 条 · 最新 \(poolAge)")
         if let m = report.measuredTurnTTFB {
             line(.ok, "实测对照", String(format: "Mirasim 整轮首字节 中位 %.1fs（%d 次，仅量级对照）", m.median, m.count))
         }

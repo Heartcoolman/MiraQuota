@@ -5,6 +5,17 @@ struct QuotaWindow: Sendable, Equatable {
     let label: String
     let usedPercent: Double
     let resetAt: Date
+    /// 该窗口是否只计特定模型档位的用量（实测 `7d_fable`）。
+    var modelScoped: Bool = false
+
+    /// 模型档位组名，取窗口名下划线之后的部分（`7d_fable` → `fable`）。
+    static func modelGroup(of label: String) -> String? {
+        guard let idx = label.lastIndex(of: "_") else { return nil }
+        let group = label[label.index(after: idx)...].lowercased()
+        return group.isEmpty ? nil : String(group)
+    }
+
+    var modelGroup: String? { modelScoped ? Self.modelGroup(of: label) : nil }
 
     /// 窗口长度，由标签解析（"5h" / "7d" / "7d Opus"）。
     var duration: TimeInterval? {
@@ -34,6 +45,11 @@ struct RelaySnapshot: Sendable {
     let relayStatus: String
     /// relay 自带的百分比环形缓冲，用于冷启动时补充校准样本。
     let history: [HistoryPoint]
+    /// 账号身份判据，带来源前缀（见 `AccountTag`）。换账号时套餐可能不同，
+    /// 百分比口径的标定样本随之不可比；帧未给出可用字段时为 nil。
+    let accountTag: String?
+    /// 当前套餐档位，取自帧内 `login.plan`（实测取值 plus / max）。
+    let plan: String?
 
     struct HistoryPoint: Sendable {
         let at: Date
@@ -154,6 +170,9 @@ struct WindowReport: Sendable {
     var etaSeconds: Double? = nil
     /// 剩余可用的美元估计：满额 ×（100 − 已用百分比），满额未知时为 nil。
     var remainingUSD: Double? = nil
+    /// 该窗口只计某一模型档位的用量时的档位组名（实测 `fable`），通用窗口为 nil。
+    /// 这类窗口的 `spentUSD` 只含同档位模型的支出，与全机支出不同口径。
+    var modelGroup: String? = nil
 
     /// 用量进度减时间进度：正数表示快于均速。
     var paceDelta: Double? { pacePercent.map { usedPercent - $0 } }
@@ -186,6 +205,9 @@ struct SpeedRow: Sendable {
     /// 本行来自逐请求实测（Claude Code OTel trace）而非回归估计。
     /// 实测行的首 token 不带 `≈`：它是测量值的中位数，不是截距。
     var measured: Bool = false
+    /// 该模型归属的额度档位组（实测 `fable`），对应 modelScoped 窗口。
+    /// 不属于任何档位窗口的模型为 nil，其用量计入通用窗口。
+    var modelGroup: String? = nil
     /// 界面显示的偏离。闸门带迟滞（进 25% / 出 18%），由 SpeedStats 判定后填入：
     /// 纯阈值在边界附近会随每轮微小变动反复出现与消失。
     var notableDrift: Double? = nil

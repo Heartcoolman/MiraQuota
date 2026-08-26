@@ -49,6 +49,8 @@ if (flag('help') || flag('h')) {
   --feed-port <N>       feed 端口（默认在 ${FEED_LO}–${FEED_HI} 里取第一个空闲的）
   --channel-port <N>    mirachannel 端口（默认从进程命令行解析，回退 ${CHANNEL_DEFAULT}）
   --router-port <N>     直接指定挂着 /v1/limits 的路由端口，跳过发现
+  --router-token <T>    /v1/limits 的会话令牌（等价 MIRAQUOTA_ROUTER_TOKEN）；
+                        POSIX 上自动从会话进程环境读取，Windows 需手工给
   --widget <路径>       控件脚本（默认 ../widget/miraquota-widget.js）`);
   process.exit(0);
 }
@@ -125,9 +127,9 @@ async function listeningPorts(pids) {
   return byPid;
 }
 
-const getJSON = async (url, ms = 2000) => {
+const getJSON = async (url, ms = 2000, headers = undefined) => {
   try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(ms) });
+    const r = await fetch(url, { signal: AbortSignal.timeout(ms), headers });
     return r.ok ? await r.json() : null;
   } catch { return null; }
 };
@@ -152,13 +154,55 @@ async function discoverChannelPort(processes) {
 }
 
 /**
+ * 路由端口 → 会话令牌。早期版本对本机免认证，现行版本按普通 API 请求鉴权。
+ * 令牌不落盘，只在 Mirasim 拉起的会话进程环境里：同一进程的 `ANTHROPIC_BASE_URL`
+ * 指向哪个回环端口，`ANTHROPIC_AUTH_TOKEN` 就是那个端口的令牌。
+ *
+ * `ps` 必须用 `-U` 限定用户：不给选择符时只列「同用户且同控制终端」的进程，
+ * 以服务方式常驻时没有控制终端，结果会是空的。Windows 的 CIM 不暴露进程环境，
+ * 该平台只能用 `--router-token` / `MIRAQUOTA_ROUTER_TOKEN` 手工给。
+ */
+async function sessionTokens() {
+  const explicit = opt('router-token', process.env.MIRAQUOTA_ROUTER_TOKEN);
+  if (explicit) return { explicit: String(explicit), byPort: new Map() };
+  if (process.platform === 'win32') return { explicit: null, byPort: new Map() };
+
+  const user = process.env.USER || process.env.LOGNAME || '';
+  const out = await run('/bin/ps', user ? ['eww', '-U', user, '-o', 'command=']
+                                        : ['eww', '-o', 'command=']);
+  const byPort = new Map();
+  for (const line of out.split('\n')) {
+    let port = null, token = null;
+    // 逐个环境项精确匹配前缀：同一行还有 MIRASIM_PTY_PIN_ANTHROPIC_BASE_URL
+    // 这类同名后缀的变量，子串匹配会配错。
+    for (const field of line.split(' ')) {
+      if (field.startsWith('ANTHROPIC_BASE_URL=http://127.0.0.1:')) {
+        const m = field.match(/:(\d+)$/);
+        if (m) port = Number(m[1]);
+      } else if (field.startsWith('ANTHROPIC_AUTH_TOKEN=')) {
+        token = field.slice('ANTHROPIC_AUTH_TOKEN='.length);
+      }
+    }
+    if (port && token) byPort.set(port, token);
+  }
+  return { explicit: null, byPort };
+}
+
+/** `/v1/limits` 的请求头。令牌为空时不带，早期免认证的版本照常放行。 */
+const limitsHeaders = (tokens, port) => {
+  const token = tokens.explicit || tokens.byPort.get(port);
+  return token ? { 'x-api-key': token } : undefined;
+};
+
+/**
  * 挂着 /v1/limits 的路由端口。
  * 限定「持有 mirachannel 端口的那个进程」的监听口：并行跑着开发实例时，
  * 别的实例可能是另一个账号，读到它的额度是错的。找不到归属就空手而归。
  */
-async function discoverRouterPort(processes, channelPort) {
+async function discoverRouter(processes, channelPort) {
+  const tokens = await sessionTokens();
   const explicit = Number(opt('router-port', 0));
-  if (explicit) return explicit;
+  if (explicit) return { port: explicit, headers: limitsHeaders(tokens, explicit) };
   if (!processes.length) return null;
 
   const byPid = await listeningPorts(processes.map((p) => p.pid));
@@ -172,7 +216,10 @@ async function discoverRouterPort(processes, channelPort) {
     (a === channelPort ? 1 : 0) - (b === channelPort ? 1 : 0));
 
   for (const p of ordered) {
-    if (parseLimits(await getJSON(`http://127.0.0.1:${p}/v1/limits`))) return p;
+    const headers = limitsHeaders(tokens, p);
+    if (parseLimits(await getJSON(`http://127.0.0.1:${p}/v1/limits`, 2000, headers))) {
+      return { port: p, headers };
+    }
   }
   return null;
 }
@@ -238,13 +285,24 @@ function relaySnapshot(channelPort) {
       if (!Array.isArray(raw)) return;
       clearTimeout(timer);
 
-      // 刻度按整帧证据判定：窗口与历史缓冲的取值全部落在 (0,1] 才按小数换算。
-      // 逐值判断区分不了「真实的 0.4%」与「小数的 0.4」。
-      const seen = raw.map((w) => num(w.usedPercent)).filter((v) => v != null);
-      for (const h of Array.isArray(relay.history) ? relay.history : []) {
-        for (const k of ['fiveHour', 'sevenDay']) if (num(h[k]) != null) seen.push(num(h[k]));
+      // 刻度优先按「已用 + 剩余」之和判定：百分数刻度下该和恒为 100，小数刻度下恒为 1，
+      // 与用量高低无关。缺 remainingPercent 时才退回量级判据（取值全部落在 (0,1] 才按
+      // 小数换算），逐值判断区分不了「真实的 0.4%」与「小数的 0.4」；该判据在窗口
+      // 滚动后的低用量期会判错，把 0.9% 放大成 90%。
+      const totals = raw
+        .map((w) => (num(w.usedPercent) != null && num(w.remainingPercent) != null
+          ? num(w.usedPercent) + num(w.remainingPercent) : null))
+        .filter((v) => v != null && v > 0.5);
+      let scale;
+      if (totals.length) {
+        scale = Math.max(...totals) < 50 ? 100 : 1;
+      } else {
+        const seen = raw.map((w) => num(w.usedPercent)).filter((v) => v != null);
+        for (const h of Array.isArray(relay.history) ? relay.history : []) {
+          for (const k of ['fiveHour', 'sevenDay']) if (num(h[k]) != null) seen.push(num(h[k]));
+        }
+        scale = seen.length && seen.some((v) => v > 0) && seen.every((v) => v <= 1) ? 100 : 1;
       }
-      const scale = seen.length && seen.every((v) => v > 0 && v <= 1) ? 100 : 1;
 
       const windows = [];
       for (const w of raw) {
@@ -281,10 +339,10 @@ const LEVELS = {
 async function collect() {
   const processes = await mirasimProcesses();
   const channelPort = await discoverChannelPort(processes);
-  const routerPort = await discoverRouterPort(processes, channelPort);
+  const router = await discoverRouter(processes, channelPort);
 
-  const limits = routerPort
-    ? parseLimits(await getJSON(`http://127.0.0.1:${routerPort}/v1/limits`))
+  const limits = router
+    ? parseLimits(await getJSON(`http://127.0.0.1:${router.port}/v1/limits`, 2000, router.headers))
     : null;
   if (limits) {
     last = { at: Date.now() / 1000, windows: limits.windows, level: 'exact', extra: limits };

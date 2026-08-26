@@ -27,6 +27,7 @@ final class QuotaEngine: ObservableObject {
     private let calibrator = Calibrator()
     private let speed = SpeedStats()
     private let anchors = AnchorStore()
+    private let accounts = AccountStore()
     private let limits = LimitsClient()
     private let relay: RelayClient
     private var timer: DispatchSourceTimer?
@@ -90,6 +91,11 @@ final class QuotaEngine: ObservableObject {
             reachable = true
             mismatchReason = nil
             unreachableReason = nil
+            // 换账号即换上游账号池，切换前的速度样本不再可比，一律弃用；
+            // 同账号内换套餐档位则只改样本归属，各档位的样本各自保留。
+            if !accounts.adopt(s.accountTag, plan: s.plan).isEmpty {
+                speed.adopt(epochStart: accounts.since, planWindows: accounts.currentWindows())
+            }
             if !seeded { calibrator.seed(from: s); seeded = true }
             calibrator.record(s)
             anchors.update(from: s)
@@ -110,7 +116,15 @@ final class QuotaEngine: ObservableObject {
         speed.refresh()
         let now = Date()
         lastLimits = limits.snapshot(now: now, anchorPort: relay.currentPort)
-        if let l = lastLimits { recordTrail(l) }
+        if let l = lastLimits {
+            recordTrail(l)
+            calibrator.record(l)
+            // modelScoped 窗口的等价支出须按同一档位过滤，账本据此另开一路分桶；
+            // 速度行同样标出档位，供界面把两者对上。
+            let groups = l.windows.compactMap(\.modelGroup)
+            ledger.adoptScopedGroups(groups)
+            speed.adoptScopedGroups(groups)
+        }
         let state = resolveState(now: now)
         let known = anchors.lastKnown
         let rate = lastLimits.flatMap { unitPrice($0, now: now) }
@@ -202,15 +216,20 @@ final class QuotaEngine: ObservableObject {
         return (w.budget - last.used) / rate
     }
 
-    /// `/v1/limits` 精确值：百分比为 `used / budget`，满额折美元按窗口自己的回归标定优先。
-    /// 各窗口的点数计价不同（实测 5h 点与 7d 点的美元密度差约 3.5 倍且随用量构成漂移），
-    /// 全局单价只对反推它的那个窗口成立，仅在回归未收敛时作兜底，且标为低置信。
+    /// `/v1/limits` 精确值：百分比为 `used / budget`，满额折美元按窗口自己的标定优先。
+    /// 各窗口的点是同一单位（实测 Δ5h点/Δ7d点 恒在 1.0 附近），但每点美元随时段的模型混比
+    /// 与缓存读占比漂移，实测跨 $0.00235–0.00502。全局单价由已用点数最多的窗口反推（恒为 7d），
+    /// 因而只对该窗口成立：挪到 5h 上实测偏高约 12%。故仅在标定未收敛时作兜底，且标为低置信。
     private func exact(_ w: LimitsSnapshot.Window, rate: Double?,
                        snapshot: RelaySnapshot?, now: Date) -> WindowReport {
         let bounds = w.quotaWindow
         let start = bounds.startAt
-        let spent = start.map { ledger.spent(from: $0, to: now, includeOpenMinute: true) } ?? 0
-        let estimate = calibrator.estimate(label: w.label, ledger: ledger)
+        let group = w.modelGroup
+        let spent = start.map {
+            ledger.spent(from: $0, to: now, includeOpenMinute: true, group: group)
+        } ?? 0
+        let estimate = calibrator.estimate(label: w.label, ledger: ledger,
+                                           budget: w.budget, group: group)
         let fullUSD: Double?
         let confidence: Calibration.Confidence
         if let estimate, estimate.confidence == .high || estimate.confidence == .medium {
@@ -237,16 +256,19 @@ final class QuotaEngine: ObservableObject {
             points: PointBalance(used: w.used, budget: w.budget),
             scaledSpentUSD: fullUSD.map { $0 * w.usedPercent / 100 },
             etaSeconds: etaSeconds(w, now: now),
-            remainingUSD: fullUSD.map { max(0, $0 * (100 - w.usedPercent) / 100) }
+            remainingUSD: fullUSD.map { max(0, $0 * (100 - w.usedPercent) / 100) },
+            modelGroup: group
         )
     }
 
-    /// 额度点单价，美元/点。取已用点数最多的窗口反推，两个窗口共用同一取值——
-    /// 实测 5h 与 7d 各自推出的单价相差 1.2%，而刚重置的窗口点数太少会失真。
+    /// 额度点单价，美元/点。取已用点数最多的窗口反推，各窗口共用同一取值：
+    /// 刚重置的窗口点数太少会失真。取值恒由 7d 反推，故 `rate × budget_7d` 与 7d 的
+    /// 百分比标定是同一个式子（支出 ÷ 百分比），两者吻合不构成互校。
     private func unitPrice(_ limits: LimitsSnapshot, now: Date) -> Double? {
         var best: (points: Double, usd: Double)?
         for w in limits.windows {
-            guard w.used >= Self.minPointsForRate, let start = w.quotaWindow.startAt else { continue }
+            guard !w.modelScoped, w.used >= Self.minPointsForRate,
+                  let start = w.quotaWindow.startAt else { continue }
             // 已用点数含开分钟内的消耗（快照是即时值），美元不含会系统性压低单价。
             let usd = ledger.spent(from: start, to: now, includeOpenMinute: true)
             guard usd > 0 else { continue }
@@ -259,8 +281,11 @@ final class QuotaEngine: ObservableObject {
     /// relay 实测：百分比直接采用，满额由标定反推。
     private func measured(_ w: QuotaWindow, snapshot: RelaySnapshot?, now: Date) -> WindowReport {
         let start = w.startAt
-        let spent = start.map { ledger.spent(from: $0, to: now, includeOpenMinute: true) } ?? 0
-        let estimate = calibrator.estimate(label: w.label, ledger: ledger)
+        let group = w.modelGroup
+        let spent = start.map {
+            ledger.spent(from: $0, to: now, includeOpenMinute: true, group: group)
+        } ?? 0
+        let estimate = calibrator.estimate(label: w.label, ledger: ledger, group: group)
         let full = estimate?.fullUSD ?? inferFull(percent: w.usedPercent, spent: spent)
         return WindowReport(
             label: w.label,
@@ -275,7 +300,8 @@ final class QuotaEngine: ObservableObject {
             trend: snapshot?.trend(for: w.label) ?? [],
             points: nil,
             scaledSpentUSD: full.map { $0 * w.usedPercent / 100 },
-            remainingUSD: full.map { max(0, $0 * (100 - w.usedPercent) / 100) }
+            remainingUSD: full.map { max(0, $0 * (100 - w.usedPercent) / 100) },
+            modelGroup: group
         )
     }
 
@@ -283,8 +309,13 @@ final class QuotaEngine: ObservableObject {
     /// 他人对共享额度的占用在本机不可见，故该百分比是下界。
     private func reckoned(_ a: Anchor, now: Date) -> WindowReport {
         let bounds = a.window(at: now)
-        let spent = bounds.map { ledger.spent(from: $0.start, to: now, includeOpenMinute: true) } ?? 0
-        let estimate = calibrator.estimate(label: a.label, ledger: ledger)
+        // 锚点只留窗口名与边界，modelScoped 标志不在其中，按窗口名推档位组：
+        // 带下划线后缀的窗口名只出现在 modelScoped 窗口上（实测 `7d_fable`）。
+        let group = QuotaWindow.modelGroup(of: a.label)
+        let spent = bounds.map {
+            ledger.spent(from: $0.start, to: now, includeOpenMinute: true, group: group)
+        } ?? 0
+        let estimate = calibrator.estimate(label: a.label, ledger: ledger, group: group)
         let percent = estimate.map { min(100, spent / $0.fullUSD * 100) } ?? 0
         return WindowReport(
             label: a.label,

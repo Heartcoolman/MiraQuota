@@ -199,14 +199,18 @@ final class RelayClient {
             return
         }
 
-        var parsed: [(label: String, used: Double, reset: Date)] = []
+        var parsed: [(label: String, used: Double, remaining: Double?, reset: Date,
+                      scoped: Bool)] = []
         for raw in rawWindows {
             guard let label = Self.pick(raw, ["label", "name", "window", "id"]) as? String,
                   let used = Self.number(Self.pick(raw, ["usedPercent", "utilization", "percent",
                                                          "used", "usage"])),
                   let reset = Self.date(Self.pick(raw, ["resetAt", "resetsAt", "reset", "expiresAt"]))
             else { continue }
-            parsed.append((label, used, reset))
+            let remaining = Self.number(Self.pick(raw, ["remainingPercent", "remaining_percent",
+                                                        "remaining"]))
+            let scoped = (Self.pick(raw, ["modelScoped", "model_scoped"]) as? Bool) ?? false
+            parsed.append((label, used, remaining, reset, scoped))
         }
 
         var rawHistory: [(at: Date, five: Double?, seven: Double?)] = []
@@ -218,13 +222,23 @@ final class RelayClient {
         }
 
         // 刻度推断。真实协议以百分数为单位，个别实现用 0–1 小数；逐值判断
-        // 区分不了「真实的 0.4%」与「小数的 0.4」——重置后的窗口恰好常落在 (0,1]，
-        // 一律 ×100 会把 0.4% 画成 40% 并写坏标定样本。故看整帧证据：
-        // 窗口与 history 里任一取值 >1 即为百分数刻度；全部落在 (0,1] 才按小数。
-        // 刚重置时 history 环形缓冲仍留着重置前 >1 的旧值，足以正确判定。
-        let magnitudes = parsed.map(\.used)
-            + rawHistory.flatMap { [$0.five, $0.seven].compactMap { $0 } }
-        let fractional = magnitudes.contains { $0 > 0 } && magnitudes.allSatisfy { $0 <= 1.0 }
+        // 区分不了「真实的 0.4%」与「小数的 0.4」——重置后的窗口恰好常落在 (0,1]。
+        //
+        // 首选证据是「已用 + 剩余」之和：百分数刻度下恒为 100，小数刻度下恒为 1，
+        // 与用量高低无关。量级判据只在缺 remaining 字段时启用，且它在低用量期会判错：
+        // 7d 窗口重置后整帧连同 history 都落在 (0,1]，一律 ×100 会把 0.9% 画成 90%
+        // 并把同样放大的样本写进标定。
+        let totals = parsed.compactMap { w in w.remaining.map { w.used + $0 } }
+            .filter { $0 > 0.5 }
+        let fractional: Bool
+        if let total = totals.max() {
+            fractional = total < 50
+        } else {
+            // 刚重置时 history 环形缓冲仍可能留着重置前 >1 的旧值，据此仍可判对。
+            let magnitudes = parsed.map(\.used)
+                + rawHistory.flatMap { [$0.five, $0.seven].compactMap { $0 } }
+            fractional = magnitudes.contains { $0 > 0 } && magnitudes.allSatisfy { $0 <= 1.0 }
+        }
         let scale = fractional ? 100.0 : 1.0
 
         var windows: [QuotaWindow] = []
@@ -232,7 +246,8 @@ final class RelayClient {
             let percent = w.used * scale
             // 值域闸门：归一化后仍不在 0–100 的不是百分比，宁可判协议不符也不显示。
             guard percent >= 0, percent <= 100.5 else { continue }
-            windows.append(QuotaWindow(label: w.label, usedPercent: percent, resetAt: w.reset))
+            windows.append(QuotaWindow(label: w.label, usedPercent: percent, resetAt: w.reset,
+                                       modelScoped: w.scoped))
         }
         guard !windows.isEmpty else {
             onEvent?(.mismatch("窗口缺少标签、百分比或重置时刻，或取值不在 0–100"))
@@ -262,8 +277,32 @@ final class RelayClient {
             host: (relay["host"] as? String) ?? "-",
             mode: (relay["mode"] as? String) ?? "-",
             relayStatus: (relay["relayStatus"] as? String) ?? (relay["status"] as? String) ?? "-",
-            history: history
+            history: history,
+            accountTag: Self.accountTag(relay),
+            plan: Self.plan(relay)
         )))
+    }
+
+    /// 账号身份判据，只认 `login.userId`。缺该字段时返回 nil 而非退到令牌尾号：
+    /// 尾号随令牌每小时轮换，拿它当判据会把轮换判成换账号。实测部分帧不带 login，
+    /// 有退路时状态会在两个命名空间之间来回切，尾号一换就误记一次切换时刻
+    /// （落盘 01:02:56，上一枚令牌的 `exp` 为 00:58:46），把样本下界抬到当下，
+    /// 账本里 1450 行可用记录被挡在门外。判不出账号即不动状态，由自检报出。
+    private static func accountTag(_ relay: [String: Any]) -> String? {
+        guard let login = relay["login"] as? [String: Any],
+              let id = pick(login, ["userId", "user_id", "id"]) as? String, !id.isEmpty
+        else { return nil }
+        return AccountTag.user(id)
+    }
+
+    /// 套餐标识。`login.plan` 是当前生效的档位，`referral.currentPlan` 为同义退路。
+    private static func plan(_ relay: [String: Any]) -> String? {
+        let login = relay["login"] as? [String: Any]
+        let referral = relay["referral"] as? [String: Any]
+        let value = (login.flatMap { pick($0, ["plan", "tier"]) } ?? referral.flatMap {
+            pick($0, ["currentPlan", "current_plan", "plan"])
+        }) as? String
+        return value.flatMap { $0.isEmpty ? nil : $0 }
     }
 
     private static func pick(_ dict: [String: Any], _ keys: [String]) -> Any? {
