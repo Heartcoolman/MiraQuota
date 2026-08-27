@@ -29,6 +29,7 @@ provider 与 widget 之间只有 HTTP，没有共享文件、没有 IPC。widget
 | 缓存 | 响应头带 `Cache-Control: no-store`；控件另加 `?t=<时间戳>`，故**路由匹配必须剥掉查询串** |
 | CORS | 渲染进程的页面源是 `file://`，响应必须带 `Access-Control-Allow-Origin: *`，并在 `Access-Control-Allow-Headers` 里列出 `X-MiraQuota-Token`，否则带令牌的 POST 过不了预检 |
 | 退出 | `POST /quit`，须带 `X-MiraQuota-Token`（值存 `~/.miraquota/feed.token`，0600，跨启动稳定）。GET 与裸 POST 一律 404：回环端口上任何网页都能发出不经预检的请求，无令牌校验时任意被访问的网页都能把 provider 关掉 |
+| 开窗 | `POST /open`，令牌同上。macOS 版用它做单实例转交：第二次点应用图标的进程拿不到实例锁，把开窗意图递给常驻实例后自退。无窗口形态的 provider 不实现即可，控件不依赖它 |
 | 端口自发现 | 控件失联时在 4988–4995 内自行重找，因此持久注入脚本里烤着的旧端口不会造成失联 |
 
 `quota.json` 根字段：
@@ -110,7 +111,7 @@ provider 侧要做到的六条，缺一条都有确定的故障形态：
 | 状态落盘 | `~/.miraquota/`（账本游标、标定样本、窗口锚点、feed 令牌、单实例锁） | 同构即可；单实例锁要带约 3 秒重试，重启时新旧实例会短暂重叠 |
 | 常驻自启 | LaunchAgent（`LimitLoadToSessionType=Aqua`，`KeepAlive.SuccessfulExit=false`） | Windows 计划任务（登录触发）或 systemd user unit |
 | 让 Mirasim 带调试端口启动 | 生成一个 `.app` 启动器，`open -na Mirasim --args --remote-debugging-port=9333` | 快捷方式追加同一参数即可。Mirasim 只从命令行接受该参数，没有环境变量或配置项 |
-| 兜底显示面 | AppKit 状态栏项 + SwiftUI 面板 | 可省。控件是主显示面，兜底缺失时只是注入不可用期间看不到数字 |
+| 兜底显示面 | AppKit 状态栏项 + SwiftUI 弹层，另有一个可从 Dock 打开的主窗口（额度 / 速度 / 自检 / 关于） | 可省。控件是主显示面，兜底缺失时只是注入不可用期间看不到数字 |
 
 移植后用 `scripts/fake-mirasim.py` 验证协议容忍度与降级路径，不必依赖真实 Mirasim：
 它伪造换过键名与刻度的 relay 帧（`renamed`）以及完全无法识别的帧（`garbage`）。

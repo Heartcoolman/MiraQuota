@@ -11,7 +11,8 @@ if arguments.contains("--help") || arguments.contains("-h") {
     MiraQuota · Mirasim 额度估算
 
     用法：
-      MiraQuota                以菜单栏常驻方式运行
+      MiraQuota                打开主窗口，同时在菜单栏常驻
+      MiraQuota --background   只常驻，不开窗口、不占 Dock（LaunchAgent 用这个）
       MiraQuota --once         采集一次并打印，用于自检
       MiraQuota --doctor       逐项检查数据链路，指出断点与处置办法
       MiraQuota --port <N>     指定 Mirasim 本地端口（默认自动发现）
@@ -46,8 +47,15 @@ if arguments.contains("--once") {
     exit(code)
 }
 
-guard InstanceLock.acquire() else {
-    FileHandle.standardError.write(Data("MiraQuota 已在运行\n".utf8))
+/// LaunchAgent 用它在登录时只常驻不开窗；从 Dock / 访达点起来则开窗。
+let background = arguments.contains("--background")
+
+// launchd 重启本进程时旧实例可能还在退出途中，故常驻模式重试；
+// 手工点起来的那次不等，立刻把「打开窗口」转交给常驻实例。
+guard InstanceLock.acquire(retries: background ? 10 : 0) else {
+    let handed = Feed.requestOpen()
+    FileHandle.standardError.write(Data(
+        (handed ? "MiraQuota 已在运行，已请它打开窗口\n" : "MiraQuota 已在运行\n").utf8))
     exit(0)
 }
 
@@ -62,6 +70,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let injector = Injector()
     private var statusItem: NSStatusItem?
     private var popover: NSPopover!
+    /// 主窗口惰性建立：常驻模式下从不打开的话就不该有这份开销。
+    private var window: NSWindow?
+    private let port: Int?
+    private let background: Bool
     private var bag = Set<AnyCancellable>()
     /// 外部点击监听。弹层改为自管开合后，需要它来实现「点别处收起」。
     private var outsideClick: Any?
@@ -71,7 +83,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 上一次向 relay 要新数据的时刻，用于限流。
     private var lastRefreshAt = Date.distantPast
 
-    init(port: Int?) {
+    init(port: Int?, background: Bool) {
+        self.port = port
+        self.background = background
         engine = QuotaEngine(port: port)
         super.init()
     }
@@ -121,11 +135,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         injector.start(feed: feed)
 
+        // 第二个实例被点起来时不再自建一份采集，把开窗的意图转交给这里。
+        feed.onOpen = { [weak self] in self?.showWindow() }
+        NotificationCenter.default.addObserver(
+            forName: Self.openWindowRequest, object: nil, queue: .main
+        ) { [weak self] _ in self?.showWindow() }
+
+        buildMenu()
+        if !background { showWindow() }
+
         // MIRAQUOTA_OPEN=1 时启动后自动展开面板，便于截图核对排版。
         if ProcessInfo.processInfo.environment["MIRAQUOTA_OPEN"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.toggle() }
         }
     }
+
+    /// 面板脚上的「窗口」按钮经它转交，避免 SwiftUI 视图直接持有 AppDelegate。
+    static let openWindowRequest = Notification.Name("MiraQuota.openMainWindow")
+
+    // MARK: 主窗口
+
+    /// 常驻实例被点第二次时也走这里：窗口已存在就抬到前面，不重建。
+    func showWindow() {
+        if window == nil {
+            let hosting = NSHostingController(rootView: MainWindow(engine: engine, port: port))
+            let w = NSWindow(contentViewController: hosting)
+            w.title = "MiraQuota"
+            w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            w.setContentSize(NSSize(width: 880, height: 620))
+            w.contentMinSize = NSSize(width: 640, height: 420)
+            // 关窗不退出应用，故窗口自己不能被释放，否则再开就是野指针。
+            w.isReleasedWhenClosed = false
+            w.setFrameAutosaveName("MiraQuotaMain")
+            w.center()
+            window = w
+        }
+        // 登录时以 .accessory 起步（不占 Dock），开窗这一刻才转为常规应用。
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// 关掉最后一个窗口不退出：本体是常驻采集，菜单栏项与客户端控件还要继续。
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// 点 Dock 图标（或再次从访达打开）时回到窗口。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showWindow()
+        return true
+    }
+
+    /// 常规应用必须自带菜单栏，否则连 ⌘Q 与文本拷贝都没有。
+    private func buildMenu() {
+        let main = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "关于 MiraQuota", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "隐藏 MiraQuota", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let others = appMenu.addItem(withTitle: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        others.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "退出 MiraQuota", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+
+        // 自检那一页的结论要能拷出来，Edit 菜单不能省。
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        main.addItem(editItem)
+
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.miniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "关闭", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(.separator())
+        let show = NSMenuItem(title: "MiraQuota 窗口", action: #selector(openWindow), keyEquivalent: "0")
+        show.target = self
+        windowMenu.addItem(show)
+        windowItem.submenu = windowMenu
+        main.addItem(windowItem)
+        NSApp.windowsMenu = windowMenu
+
+        NSApp.mainMenu = main
+    }
+
+    @objc private func openWindow() { showWindow() }
 
     func applicationWillTerminate(_ notification: Notification) {
         injector.stop()
@@ -237,8 +338,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-let delegate = AppDelegate(port: portOverride)
+let delegate = AppDelegate(port: portOverride, background: background)
 let application = NSApplication.shared
 application.delegate = delegate
-application.setActivationPolicy(.accessory)
+// 常驻模式不占 Dock；从 Dock / 访达点起来的那次直接以常规应用起步，
+// 免得先出现图标再被收走造成一次闪动。
+application.setActivationPolicy(background ? .accessory : .regular)
 application.run()

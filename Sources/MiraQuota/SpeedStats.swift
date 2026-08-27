@@ -65,8 +65,11 @@ final class SpeedStats {
     private static let rateJump = 0.6
     /// 超过这个时长没有请求就不再成行，避免把昨天的速度当成当下的。
     private static let recencyLimit: TimeInterval = 2 * 3600
-    /// 扣掉首 token 后剩余的出字时间下限，防止短请求把速度算到天上。
+    /// 样本进入速率统计所需的最短出字时间。短于此的样本不参与：按这个值补一段
+    /// 出字时间等于凭空造出吞吐，它的输出量全进加权和的分子，显示值被整体抬高。
     private static let minStreamSeconds = 0.25
+    /// 速率的合理带。上界同时用作逐样本判据，见 `plausible`。
+    private static let rateRange = 5.0...1000.0
     /// 实测对照保留的事件数。
     private static let measuredKeep = 20
     /// 实测样本比账本样本旧过这个时长即改走回归。实测通道会整段中断
@@ -617,10 +620,13 @@ final class SpeedStats {
         // 逐条比值噪声极大，加权后长请求自然占主导，同时新样本一到就能推动结果。
         var rate: Double?
         if let ttft {
-            let seconds = recent.reduce(0.0) { $0 + max(Double($1.ms) / 1000 - ttft, Self.minStreamSeconds) }
+            // 扣掉回归首 token 后剩不下出字段的样本不进速率。这类样本多是回归截距
+            // 大于其真实首 token 等待的短请求，按下限补时间会把它的输出量整份计入分子。
+            let streaming = recent.filter { Double($0.ms) / 1000 - ttft >= Self.minStreamSeconds }
+            let seconds = streaming.reduce(0.0) { $0 + Double($1.ms) / 1000 - ttft }
             if seconds > 0 {
-                let r = Double(out) / seconds
-                if r >= 5, r <= 1000 { rate = r }
+                let r = Double(streaming.reduce(0) { $0 + $1.out }) / seconds
+                if Self.rateRange.contains(r) { rate = r }
             }
         }
 
@@ -660,12 +666,14 @@ final class SpeedStats {
         // 速率仍按 token 加权。输出太少的样本流式段不足以稳定测速，
         // 只参与首 token 的中位数，不参与速率。
         func weighted(_ samples: [MeasuredSample]) -> Double? {
-            let eligible = samples.filter { $0.out >= Self.minOutput && $0.durationMs > $0.ttftMs }
+            let eligible = samples.filter {
+                $0.out >= Self.minOutput && $0.durationMs > $0.ttftMs && Self.plausible($0)
+            }
             let out = eligible.reduce(0) { $0 + $1.out }
             let seconds = eligible.reduce(0.0) { $0 + Double($1.durationMs - $1.ttftMs) / 1000 }
             guard seconds > 0 else { return nil }
             let r = Double(out) / seconds
-            return (r >= 5 && r <= 1000) ? r : nil
+            return Self.rateRange.contains(r) ? r : nil
         }
         var rate = weighted(recent)
         let baselineRate = weighted(group)
@@ -714,13 +722,15 @@ final class SpeedStats {
             let recent = Array(byTime.filter { $0.model == newest.model }.suffix(Self.recentCount))
             let ttft = recent.last.map { Double($0.ttftMs) / 1000 }
             // 输出太少的样本流式段不足以稳定测速，只参与首 token，不参与速率。
-            let eligible = recent.filter { $0.out >= Self.minOutput && $0.durationMs > $0.ttftMs }
+            let eligible = recent.filter {
+                $0.out >= Self.minOutput && $0.durationMs > $0.ttftMs && Self.plausible($0)
+            }
             let out = eligible.reduce(0) { $0 + $1.out }
             let seconds = eligible.reduce(0.0) { $0 + Double($1.durationMs - $1.ttftMs) / 1000 }
             var rate: Double?
             if seconds > 0 {
                 let r = Double(out) / seconds
-                if r >= 5, r <= 1000 { rate = r }
+                if Self.rateRange.contains(r) { rate = r }
             }
             guard ttft != nil || rate != nil else { return nil }
             return SessionSpeedRow(session: session, model: Self.shortName(newest.model),
@@ -748,12 +758,20 @@ final class SpeedStats {
         }
         guard slopes.count >= Self.minPairs, let b = Self.median(slopes), b > 0 else { return (nil, nil) }
         let rate = 1000 / b
-        guard rate >= 5, rate <= 1000 else { return (nil, nil) }
+        guard Self.rateRange.contains(rate) else { return (nil, nil) }
         // 截距为负说明线性关系在这批样本上不成立，此时不给首 token。
         guard let a = Self.median(sorted.map { Double($0.ms) - b * Double($0.out) }), a >= 0 else {
             return (rate, nil)
         }
         return (rate, a / 1000)
+    }
+
+    /// 逐样本判据：出字段承载不了该样本自称的输出量即剔除。整段响应在长时间等待后
+    /// 一次到达时（中继缓冲、非流式回落），`durationMs - ttftMs` 只剩几十毫秒，
+    /// 它的 token 全进加权和的分子却几乎不进分母，单条即可把显示值抬到两百以上。
+    private static func plausible(_ s: MeasuredSample) -> Bool {
+        let seconds = Double(s.durationMs - s.ttftMs) / 1000
+        return seconds > 0 && Double(s.out) / seconds <= rateRange.upperBound
     }
 
     private static func median(_ v: [Double]) -> Double? {

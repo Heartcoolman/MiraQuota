@@ -27,7 +27,7 @@
 MiraQuota 由三部分组成：
 
 - **控件**（`widget/miraquota-widget.js`）：纯 JavaScript + Shadow DOM，无外部依赖，负责全部界面呈现；
-- **常驻进程**（macOS 主实现，Swift）：聚合各数据源，完成美元折算、满额标定与速度估计，经回环 HTTP 向控件供数，并执行 CDP 注入；附带菜单栏兜底显示与 LaunchAgent 自启；
+- **常驻进程**（macOS 主实现，Swift）：聚合各数据源，完成美元折算、满额标定与速度估计，经回环 HTTP 向控件供数，并执行 CDP 注入；自带可从 Dock 打开的主窗口、菜单栏兜底显示与 LaunchAgent 自启；
 - **provider-node/**：上述常驻进程的 Node 22+ 跨平台参考实现（单文件、零依赖），覆盖额度点数、百分比、重置倒计时与均速游标。
 
 <table>
@@ -129,11 +129,29 @@ Windows 上另有一条不同路线：[chiakinanam1/mirasim-quota-widget](https:
 
 `install.sh` 把应用拷贝进 `~/Applications`，自启项指向该副本，因此安装后移动或删除仓库目录都不影响运行。
 
-安装完成后随登录自动启动，无需手动打开。进程崩溃由 launchd 自动拉起；从面板点「退出」是正常退出，
-保持退出状态直到下次登录。首次安装后 macOS 会弹出一则「App 后台活动」通知，属正常现象。
+安装完成后随登录自动启动，无需手动打开。登录那一路带 `--background`，只常驻采集，不开窗口也不占 Dock。
+进程崩溃由 launchd 自动拉起；从面板或窗口点「退出」是正常退出，保持退出状态直到下次登录。
+首次安装后 macOS 会弹出一则「App 后台活动」通知，属正常现象。
 构建依赖完整版 Xcode（SwiftUI 的宏插件不在 Command Line Tools 中），见「系统要求」。
 
 菜单栏图标不出现等运行问题的处置见[命令行与故障排除](#命令行与故障排除)。
+
+### 主窗口
+
+`open -a MiraQuota`，或在启动台点图标；首次打开后可在 Dock 图标上右键 →「选项」→「在 Dock 中保留」。
+常驻实例已在运行时，再次打开不会另起一份采集：新进程拿不到实例锁，改经回环接口
+（`POST /open`，与 `/quit` 同一令牌）把开窗的意图转交给常驻实例，随即退出。
+
+窗口分四页，数据与弹层、客户端控件同源，不另起采集：
+
+| 页 | 内容 |
+| --- | --- |
+| 额度 | 通道档位与采集时刻、各窗口完整读数、满额与账本口径 |
+| 速度 | 按模型的出字速度与首 token，按会话分行（需逐请求实测样本），以及数字出处 |
+| 自检 | `--doctor` 的同一套检查，分区呈现，结论可选中拷贝 |
+| 关于 | 版本、数据路径与访达入口、退让阶梯、退出 |
+
+关掉窗口不退出应用：本体是常驻采集，菜单栏项与客户端控件继续工作。
 
 ## 客户端内控件（CDP 注入）
 
@@ -468,6 +486,7 @@ MiraQuota --port 4979 --once                # 应报「协议不符」并转入�
 ```bash
 MiraQuota --doctor        # 逐项检查链路，指出断点与处置办法
 MiraQuota --once          # 采集一次并打印
+MiraQuota --background    # 只常驻，不开窗口、不占 Dock（LaunchAgent 用这一路）
 MIRAQUOTA_DEBUG=1 ...     # 打印通道收到的原始帧
 MIRAQUOTA_OFFLINE=1 ...   # 强制离线，验证降级路径是否可用
 MIRAQUOTA_SPEED_SPAN=45   # 覆盖速度统计的窗口长度（秒），验证样本不足的退化分支
@@ -479,6 +498,24 @@ MiraQuota --port 4970     # 指定端口，默认自动发现
 
 端口发现顺序：`--port` 参数 → 4970 → 从 `ps` 解析 `server.cjs serve --port N`，
 逐个用 `/api/health` 校验；连续失败后额外扫描 4970–4980。
+
+改控件样式时不必反复重启 Mirasim：
+
+```bash
+scripts/widget-shot.sh dark          # 无头 Chrome 出图，数据取本机 4988 的真实读数
+scripts/widget-shot.sh light /tmp/a.png
+```
+
+取景台（`scripts/widget-preview.html`）铺一条标题栏替身供吸附判定，经本地 http 服务加载——
+`file://` 页面的源是不透明的，`localStorage` 会直接抛异常，控件退到内存态，位置与吸附都测不出。
+入场动画在截图上看不出来（无头 Chrome 的虚拟时间把定时器一次跑完，落到画面上永远是终帧），
+用 `?probe=1` 读计算样式核对：
+
+```bash
+# 输出各卡片的 animation-name / delay，以及减弱动态效果下是否归零
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new \
+  --virtual-time-budget=3000 --dump-dom "http://127.0.0.1:<端口>/index.html?probe=1"
+```
 
 **菜单栏图标不出现**（`--doctor` 显示作业在运行，但看不到图标）：
 

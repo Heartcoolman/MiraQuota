@@ -24,6 +24,31 @@ final class Feed {
 
     /// 监听端口在 feed 队列上写入，注入器在自己的队列上读，须经锁。
     private var boundPort: UInt16?
+    /// 常驻实例收到「打开主窗口」的请求。第二个实例点起来时经此转交。
+    var onOpen: (() -> Void)?
+
+    /// 请求已在运行的实例打开主窗口。端口在 `portRange` 内浮动，逐个试；
+    /// 令牌与常驻实例同源（`~/.miraquota/feed.token`），不匹配的一律 403。
+    static func requestOpen() -> Bool {
+        guard let token = try? String(contentsOf: Paths.feedToken, encoding: .utf8) else { return false }
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        for candidate in portRange {
+            guard let url = URL(string: "http://127.0.0.1:\(candidate)/open") else { continue }
+            var request = URLRequest(url: url, timeoutInterval: 1.2)
+            request.httpMethod = "POST"
+            request.setValue(trimmed, forHTTPHeaderField: "X-MiraQuota-Token")
+            let gate = DispatchSemaphore(value: 0)
+            var ok = false
+            URLSession.shared.dataTask(with: request) { _, response, _ in
+                ok = (response as? HTTPURLResponse)?.statusCode == 200
+                gate.signal()
+            }.resume()
+            _ = gate.wait(timeout: .now() + 1.5)
+            if ok { return true }
+        }
+        return false
+    }
+
     var port: UInt16? {
         lock.lock(); defer { lock.unlock() }
         return boundPort
@@ -140,6 +165,18 @@ final class Feed {
         case ("GET", "/quota.json"), ("GET", "/"):
             lock.lock(); let payload = body; lock.unlock()
             send(c, status: "200 OK", body: payload, type: "application/json; charset=utf-8")
+        case ("POST", "/open"):
+            // 第二个实例被点起来时把「打开窗口」的意图递给常驻实例，自己随即退出。
+            guard Self.headerValue(text, "x-miraquota-token") == token else {
+                send(c, status: "403 Forbidden", body: Data(), type: nil)
+                return
+            }
+            guard let onOpen else {
+                send(c, status: "404 Not Found", body: Data(), type: nil)
+                return
+            }
+            send(c, status: "200 OK", body: Data("{\"ok\":true}".utf8), type: "application/json")
+            DispatchQueue.main.async { onOpen() }
         case ("POST", "/quit"):
             // 令牌不符一律 403。GET 分支已删：img 标签一类的简单请求不经预检就能送达，
             // 带自定义头的 POST 则必须先过 OPTIONS，令牌值才是真正的闸门。

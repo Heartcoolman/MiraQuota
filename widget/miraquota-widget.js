@@ -13,6 +13,11 @@
  * v14 去掉「双击回默认位」：该手势与「点胶囊开合」共用同一目标，快速开合面板时会误触发，
  * 代价是丢掉拖好的位置且无法撤销。位置已有视口夹取兜底，无须复位入口。
  *
+ * v19 布局与动画一轮打磨：页脚由顿点长串改为键值三行；展开时卡片与进度条错峰落位
+ * （序号写在卡片的 --i 上，须走 setProperty——`style['--i']=x` 静默无效）；
+ * 均速游标改为出条上下各一像素，压在实色段上也分得清；
+ * 有请求在途时胶囊上的点跟着跳，收起状态下也看得出正在生成。
+ *
  * v15–v17 加标题栏吸附：宿主标题栏右侧本就排着自己的控件，控件贴右上角会压在上面。
  * 拖到标题栏空位附近即吸附（吸附位取「不与宿主控件重叠的最右一段空位」），
  * 之后随宿主布局变化（窗口缩放、标签增减）一起走。拖离即解除。
@@ -21,7 +26,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 18;
+  const VERSION = 19;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -241,27 +246,30 @@
   .dot.stale { background: var(--warn); }
   .dot.reckoned { background: var(--warn); }
   .dot.mismatch { background: var(--bad); }
+  /* 有请求在途：胶囊收起时也能看出正在生成，不必展开。 */
+  .dot.busy { animation: mqPulse 1.2s ease-in-out infinite; }
   .sep { width: .5px; height: 11px; background: var(--bd); }
   .lb { color: var(--ink2); font-weight: 600; }
   /* 纯色文字盖在磨砂材质上，色相接近背景时几乎读不出来，垫一层同色底色。 */
   .v.warn { color: var(--warn); background: var(--warnbg); border-radius: 5px; padding: 0 3px; }
   .v.bad { color: var(--bad); background: var(--badbg); border-radius: 5px; padding: 0 3px; }
-  .u { color: var(--ink3); }
+  /* 胶囊上的金额取次级色而非三级：它是收起状态下唯一的绝对量，压得太暗就读不出。 */
+  .u { color: var(--ink2); }
 
   .pop {
-    position: fixed; width: 300px; border-radius: 14px; padding: 11px; z-index: 2147483646;
+    position: fixed; width: 306px; border-radius: 16px; padding: 12px; z-index: 2147483646;
     max-height: calc(100vh - 16px); overflow-y: auto; overscroll-behavior: contain;
     background: var(--pop); border: .5px solid var(--bd); box-shadow: var(--shadow);
     color: var(--ink); font-size: 12px; backdrop-filter: blur(56px) saturate(180%);
-    opacity: 0; transform: scale(.96) translateY(-5px); transform-origin: top right;
-    pointer-events: none; transition: opacity .16s ease, transform .18s var(--ease);
+    opacity: 0; transform: scale(.965) translateY(-6px); transform-origin: top right;
+    pointer-events: none; transition: opacity .18s ease, transform .26s var(--ease);
     user-select: text; -webkit-user-select: text;
   }
   .pop.on { opacity: 1; transform: none; pointer-events: auto; }
   .pop::-webkit-scrollbar { width: 6px; }
   .pop::-webkit-scrollbar-thumb { background: var(--bd); border-radius: 3px; }
-  .hd { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-  .hd .t { font-size: 13px; font-weight: 700; letter-spacing: .01em; }
+  .hd { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+  .hd .t { font-size: 13px; font-weight: 700; letter-spacing: .02em; }
   .chip { margin-left: auto; display: flex; align-items: center; gap: 5px; padding: 2.5px 8px;
     border-radius: 9px; background: var(--bg); color: var(--ink2); font-size: 10px; font-weight: 500;
     transition: background .2s ease, color .2s ease; }
@@ -270,25 +278,41 @@
   .chip .dot { width: 5px; height: 5px; }
   .banner { padding: 7px 9px; border-radius: 8px; background: var(--bg); color: var(--ink2);
     font-size: 10.5px; margin-bottom: 8px; line-height: 1.45; }
-  .card { padding: 8px 10px; border-radius: 10px; background: var(--card);
+  /* 展开时逐张落位。--i 由 drawCards 写在卡片上，错峰四十余毫秒，
+     视线跟着从上往下走一遍，比整层同时出现更容易读出顺序。 */
+  @keyframes mqCardIn { from { opacity: 0; transform: translateY(7px); } }
+  .pop.on .card { animation: mqCardIn .34s var(--ease) backwards;
+    animation-delay: calc(var(--i, 0) * 45ms); }
+  .card { padding: 9px 10px; border-radius: 11px; background: var(--card);
+    transition: background .18s ease;
     border: .5px solid var(--cardbd); margin-bottom: 6px;
     box-shadow: inset 0 .5px 0 var(--cardhl); }
+  .card:hover { background: var(--cardhi); }
   /* 主窗口（5h）在三张卡里权重最高，金额字号与底色都略强一档。 */
   .card.primary { background: var(--cardhi); }
-  .card.primary .amt b { font-size: 15px; }
+  .card.primary:hover { background: var(--bgh); }
+  .card.primary .amt b { font-size: 16px; }
+  /* 速度卡与上面三张窗口卡是两类东西，间距拉开一档，不连成一片。 */
+  #speedbox { display: block; margin-top: 3px; }
   /* 标签定宽：三个窗口名长度不同，不定宽金额会各自起在不同位置。 */
-  .crow { display: grid; grid-template-columns: 78px 1fr auto; align-items: baseline; gap: 4px; }
+  .crow { display: grid; grid-template-columns: 74px 1fr auto; align-items: baseline; gap: 5px; }
   .crow .wl { font-size: 11px; color: var(--ink2); font-weight: 550; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
   .crow .amt { font-size: 13.5px; font-weight: 700; letter-spacing: -.01em;
     font-variant-numeric: tabular-nums; white-space: nowrap; }
   .crow .amt i { font-style: normal; font-size: 10px; font-weight: 500; color: var(--ink3); }
-  .crow .pc { justify-self: end; font-size: 11px; font-weight: 650; padding: 1.5px 7px;
+  .crow .pc { justify-self: end; font-size: 11px; font-weight: 650; padding: 2px 7px;
+    font-variant-numeric: tabular-nums; letter-spacing: -.01em;
     border-radius: 8px; font-variant-numeric: tabular-nums;
     background: var(--accentbg); color: var(--accent); transition: background .2s ease, color .2s ease; }
   .pc.warn { background: var(--warnbg); color: var(--warn); }
   .pc.bad { background: var(--badbg); color: var(--bad); }
-  .bar { position: relative; height: 5px; border-radius: 3px; background: var(--track);
+  @keyframes mqBarIn { from { transform: scaleX(0); } }
+  /* 与卡片同一节奏，稍晚一点：卡片先落位，条再长出来。 */
+  .pop.on .bar .fill { animation: mqBarIn .55s var(--ease) backwards;
+    animation-delay: calc(var(--i, 0) * 45ms + 70ms); transform-origin: left center; }
+  .bar { position: relative; height: 6px; border-radius: 3px; background: var(--track);
+    box-shadow: inset 0 .5px 1px rgba(0,0,0,.14);
     margin-top: 6px; overflow: hidden; }
   .bar .fill { position: absolute; inset: 0 auto 0 0; border-radius: 3px; min-width: 3px;
     background: linear-gradient(90deg, var(--accent), var(--accent2));
@@ -300,7 +324,7 @@
     box-shadow: 0 0 8px var(--badglow); }
   /* 均速游标：不跨出轨道，低用量时不再与填充叠成十字。 */
   /* 线用前景色、外圈用底色：两个主题下都是「深线浅圈」或「浅线深圈」，不会只剩描边。 */
-  .bar .pace { position: absolute; top: 0; bottom: 0; width: 2px; border-radius: 1px;
+  .bar .pace { position: absolute; top: -1px; bottom: -1px; width: 2px; border-radius: 1px;
     background: var(--ink2); box-shadow: 0 0 0 1px var(--notch);
     transition: left .5s var(--ease); }
   .foot { display: flex; margin-top: 5px; font-size: 9.5px; color: var(--ink2);
@@ -310,20 +334,29 @@
   .foot .r { margin-left: auto; padding-left: 8px; color: var(--ink3); }
   .sub { margin-top: 3px; font-size: 9px; color: var(--ink3); white-space: nowrap;
     font-variant-numeric: tabular-nums; }
+  /* 模型名与数值列定宽：宽度随内容浮动时，偏离标与时刻会逐行错开。
+     数值列可压到下限后省略，不折行——折行会撑高行高并推歪右侧两列。 */
   .sp { display: flex; align-items: center; gap: 6px; font-size: 10px; margin-top: 5px; }
-  .sp .m { max-width: 96px; flex: none; color: var(--ink); font-weight: 600;
+  .sp .m { width: 58px; flex: none; color: var(--ink); font-weight: 600;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sp .v { font-variant-numeric: tabular-nums; color: var(--ink2); white-space: nowrap; }
-  .sp .dr { font-variant-numeric: tabular-nums; }
+  .sp .v { min-width: 100px; font-variant-numeric: tabular-nums; color: var(--ink2);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sp .dr { flex: none; font-variant-numeric: tabular-nums; }
   .sp .dr.slow { color: var(--warn); background: var(--warnbg); border-radius: 5px; padding: 0 4px; }
   .sp .dr.fast { color: var(--ok); background: var(--okbg); border-radius: 5px; padding: 0 4px; }
-  .sp .n { margin-left: auto; color: var(--ink3); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+  .sp .n { margin-left: auto; flex: none; white-space: nowrap; color: var(--ink3);
+    font-size: 9.5px; font-variant-numeric: tabular-nums; }
   .live { display: inline-flex; align-items: center; gap: 4px; font-size: 9.5px; color: var(--ok); font-weight: 600;
     background: var(--okbg); border-radius: 8px; padding: 2px 7px; }
   .pulse { width: 6px; height: 6px; border-radius: 3px; background: var(--ok); animation: mqPulse 1.2s ease-in-out infinite; }
   @keyframes mqPulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .3; transform: scale(.7); } }
   .meta { font-size: 9.5px; color: var(--ink3); line-height: 1.6; }
-  .hair { height: .5px; background: var(--bd); margin: 8px 0 6px; }
+  /* 三行键值。原先是一长串顿点连缀，键与值混在一起，扫不出哪段是哪段。 */
+  .mrow { display: grid; grid-template-columns: 30px 1fr; gap: 6px; align-items: baseline; }
+  .mrow .k { color: var(--ink3); opacity: .8; }
+  .mrow .mv { color: var(--ink2); font-variant-numeric: tabular-nums;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hair { height: .5px; background: var(--bd); margin: 9px 0 7px; }
   .bottom { display: flex; align-items: center; margin-top: 5px; font-size: 9.5px; color: var(--ink3);
     font-variant-numeric: tabular-nums; }
   .quit { margin-left: auto; color: var(--ink2); cursor: default; padding: 2.5px 9px;
@@ -349,8 +382,11 @@
       <div id="cards"></div>
       <div id="speedbox"></div>
       <div class="hair"></div>
-      <div class="meta" id="meta1"></div>
-      <div class="meta" id="meta2"></div>
+      <div class="meta">
+        <div class="mrow" id="rowFull"><span class="k">满额</span><span class="mv" id="metaFull"></span></div>
+        <div class="mrow" id="rowLedger"><span class="k">账本</span><span class="mv" id="metaLedger"></span></div>
+        <div class="mrow" id="rowLine"><span class="k">线路</span><span class="mv" id="metaLine"></span></div>
+      </div>
       <div class="bottom"><span id="stamp"></span><span class="quit" id="quit">退出</span></div>
     </div>
   </div>`;
@@ -363,7 +399,10 @@
     sep: $('sep'), seg2: $('seg2'), lb2: $('lb2'), v2: $('v2'),
     chip: $('chip'), cdot: $('cdot'), clabel: $('clabel'),
     banners: $('banners'), cards: $('cards'), speedbox: $('speedbox'),
-    meta1: $('meta1'), meta2: $('meta2'), stamp: $('stamp'), quit: $('quit'),
+    rowFull: $('rowFull'), metaFull: $('metaFull'),
+    rowLedger: $('rowLedger'), metaLedger: $('metaLedger'),
+    rowLine: $('rowLine'), metaLine: $('metaLine'),
+    stamp: $('stamp'), quit: $('quit'),
   };
 
   // 供下一个版本热替换时调用：断开 observer 与定时器后再摘宿主，避免上述互抢。
@@ -418,6 +457,11 @@
 
   function setStyle(el, key, value) {
     if (el && el.style[key] !== value) el.style[key] = value;
+  }
+
+  /// 自定义属性（--x）不在 CSSStyleDeclaration 的具名属性里，赋值不会生效，也不报错。
+  function setVar(el, key, value) {
+    if (el && el.style.getPropertyValue(key) !== value) el.style.setProperty(key, value);
   }
 
   function toneOf(p) { return p >= 95 ? 'bad' : p >= 80 ? 'warn' : ''; }
@@ -737,7 +781,10 @@
     // 圆点只编码通道状态；用量档位改由数字与百分比胶囊的颜色表达，
     // 两个信号不再互相覆盖。
     const stateKey = state.err ? '' : (d && d.state) || '';
-    setTone(els.dot, 'dot', stateKey);
+    // 有请求在途时胶囊上的点跟着跳：收起状态下这是唯一能看出「正在生成」的地方，
+    // 详情层里的「生成中」标记要展开才看得到。
+    const busy = !!(d && d.speed && (d.speed.inflight || []).length);
+    setTone(els.dot, 'dot', (stateKey + (busy ? ' busy' : '')).trim());
     setTone(els.cdot, 'dot', stateKey);
 
     drawPill(d);
@@ -839,6 +886,10 @@
       const c = cardFor(w.label);
       const tone = toneOf(w.usedPercent);
       setTone(c.el, 'card', i === 0 ? 'primary' : '');
+      // 展开动画的落位次序，见 CSS 的 mqCardIn / mqBarIn。
+      // 自定义属性只能走 setProperty：`style['--i'] = x` 是静默无效的，
+      // 三张卡的序号都取不到，错峰就退化成同时出现。
+      setVar(c.el, '--i', String(i));
       setText(c.wl, winTitle(w.label));
       // 主行按点数口径折算，与百分比、进度条同分母；账本支出落到副行。
       setText(c.amt, usd(w.scaledSpentUSD != null ? w.scaledSpentUSD : w.spentUSD));
@@ -860,7 +911,8 @@
           setText(c.eta, '· 到重置不满');
           setTone(c.eta, 'eta', '');
         } else {
-          setText(c.eta, `· ≈${fmtDur(w.etaSeconds)}后打满`);
+          // 有底色的徽标自成一段，前面再挂个顿点会显得它是上一段的续写。
+          setText(c.eta, `≈${fmtDur(w.etaSeconds)}后打满`);
           setTone(c.eta, 'eta', 'soon');
         }
       } else {
@@ -895,6 +947,9 @@
       + `<span class="tag" style="justify-self:end;font-size:9.5px"></span></div>`
       + `<div class="rows"></div>`
       + `<div class="none" style="margin-top:5px;color:var(--ink2);font-size:10px"></div>`;
+    // 排在窗口卡之后落位；窗口数不定，取一个够大的序号即可。
+    el.style.setProperty('--i', '3');
+
     speedCard = {
       el, tag: el.querySelector('.tag'), rows: el.querySelector('.rows'),
       none: el.querySelector('.none'), pulse: null,
@@ -966,24 +1021,31 @@
 
   function drawFooter(d) {
     if (!d) {
-      setText(els.meta1, '');
-      setText(els.meta2, '');
+      setHidden(els.rowFull, true);
+      setHidden(els.rowLedger, true);
+      setHidden(els.rowLine, true);
       setText(els.stamp, '');
       return;
     }
-    setHidden(els.meta1, !d.unitPriceUSD);
+    setHidden(els.rowFull, !d.unitPriceUSD);
     if (d.unitPriceUSD) {
-      setText(els.meta1, `满额 回归标定优先 · 兜底 额度点 × $${d.unitPriceUSD.toFixed(6)}`);
+      setText(els.metaFull, `回归标定优先 · 兜底 额度点 × $${d.unitPriceUSD.toFixed(6)}`);
     }
     // 只有 windows / capturedAt / state / stateLabel 是必填字段（见 docs/ARCHITECTURE.md），
     // 其余按有值的部分拼，缺项不显示——否则精简的 provider 会在这一行显示 undefined。
-    const meta = [];
-    if (d.buckets != null) meta.push(`${d.buckets} 分钟桶`);
-    if (d.pricing) meta.push(d.pricing);
-    if (d.mode || d.host) meta.push([d.mode, d.host].filter(Boolean).join(' '));
-    if (d.relayStatus) meta.push(d.relayStatus);
-    setHidden(els.meta2, !meta.length);
-    setText(els.meta2, meta.join(' · '));
+    const ledger = [];
+    if (d.buckets != null) ledger.push(`${d.buckets} 分钟桶`);
+    if (d.pricing) ledger.push(d.pricing);
+    setHidden(els.rowLedger, !ledger.length);
+    setText(els.metaLedger, ledger.join(' · '));
+
+    const line = [];
+    if (d.mode || d.host) line.push([d.mode, d.host].filter(Boolean).join(' '));
+    if (d.relayStatus) line.push(d.relayStatus);
+    setHidden(els.rowLine, !line.length);
+    setText(els.metaLine, line.join(' · '));
+    // 整行的完整取值挂在 title 上：值列过长时截尾，鼠标停住仍读得到。
+    els.metaLine.title = line.join(' · ');
     setTick(els.stamp, clock(d.capturedAt));
   }
 

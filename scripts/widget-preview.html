@@ -1,0 +1,80 @@
+<!doctype html>
+<!-- 控件的离线取景台：在浏览器里按宿主的样子铺一层底，加载 widget 脚本，
+     数据仍取本机 4988 的真实读数。改样式时用它出图，不必重启 Mirasim。
+     用法：scripts/widget-shot.sh [dark|light] [open|closed] -->
+<html data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>MiraQuota 控件取景</title>
+<style>
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: #1b1d21;
+    font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+  }
+  html[data-theme="light"] body { background: #f2f3f5; }
+  /* 宿主标题栏的替身：控件会吸附到它的空位上，取景时要有这么一条。 */
+  .bar {
+    height: 34px; background: #26282d; display: flex; align-items: center;
+    gap: 10px; padding: 0 12px; color: rgba(255,255,255,.55); font-size: 12px;
+  }
+  html[data-theme="light"] .bar { background: #e4e6ea; color: rgba(0,0,0,.5); }
+  .bar .tab { padding: 2px 10px; border-radius: 6px; background: rgba(255,255,255,.07); }
+  html[data-theme="light"] .bar .tab { background: rgba(0,0,0,.06); }
+  .page { padding: 20px; color: rgba(255,255,255,.25); font-size: 12px; line-height: 1.8; }
+  html[data-theme="light"] .page { color: rgba(0,0,0,.25); }
+</style>
+</head>
+<body>
+  <div class="bar"><span>Mirasim</span><span class="tab">Default</span></div>
+  <div class="page">取景台底衬。控件在右上角。</div>
+<script>
+  window.__MIRAQUOTA_FEED__ = 'http://127.0.0.1:4988';
+  const params = new URLSearchParams(location.search);
+  if (params.get('theme') === 'light') document.documentElement.setAttribute('data-theme', 'light');
+</script>
+<script src="./widget-preview-src.js"></script>
+<script>
+  // 出图前把详情层展开：控件不暴露内部状态，用一次真实点击驱动。
+  if (params.get('open') !== '0') {
+    const tryOpen = () => {
+      const host = document.getElementById('miraquota-widget');
+      const pill = host && host.shadowRoot && host.shadowRoot.querySelector('.pill');
+      if (!pill) return setTimeout(tryOpen, 120);
+      const at = pill.getBoundingClientRect();
+      const opts = { bubbles: true, composed: true, button: 0,
+                     clientX: at.left + 8, clientY: at.top + 8 };
+      // 控件按 mousedown / mouseup 判「点」与「拖」，两者都要发，且中间不许移动。
+      pill.dispatchEvent(new MouseEvent('mousedown', opts));
+      window.dispatchEvent(new MouseEvent('mouseup', opts));
+    };
+    setTimeout(tryOpen, 300);
+  }
+
+  // 探针：把入场动画的计算值写进 title，供 --dump-dom 读出。
+  // 截图看不出动画——无头 Chrome 的虚拟时间会把定时器一次跑完，
+  // 落到画面上永远是终帧；计算样式则与是否正在播放无关，可以直接核对。
+  if (params.get('probe') === '1') {
+    setTimeout(() => {
+      const sr = document.getElementById('miraquota-widget').shadowRoot;
+      const read = (el, tag) => {
+        const cs = getComputedStyle(el);
+        return `${tag} name=${cs.animationName} delay=${cs.animationDelay} dur=${cs.animationDuration}`;
+      };
+      const out = [...sr.querySelectorAll('.card')].map((el, i) => {
+        const fill = el.querySelector('.fill');
+        const idx = getComputedStyle(el).getPropertyValue('--i').trim();
+        return `[${i} --i=${idx}] ` + read(el, 'card')
+          + (fill ? ' | ' + read(fill, 'fill') : '');
+      });
+      const pop = sr.querySelector('.pop');
+      out.push('pop transition=' + getComputedStyle(pop).transition);
+      const dot = sr.querySelector('.pill .dot');
+      out.push('pill dot class=' + dot.className
+               + ' anim=' + getComputedStyle(dot).animationName);
+      document.title = 'PROBE ' + out.join(' ;; ');
+    }, 900);
+  }
+</script>
+</body>
+</html>

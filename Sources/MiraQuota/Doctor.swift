@@ -5,18 +5,75 @@ import Foundation
 /// 通道失效时先跑这个，它会说明是 Mirasim 没运行、端口变了、协议变了，
 /// 还是本地账本的问题，并给出对应动作。
 enum Doctor {
-    private enum Mark: String {
+    enum Mark: String {
         case ok = "✓", warn = "!", bad = "✗"
+    }
+
+    /// 一条检查结论。窗口按此渲染，终端按此打印，两处同源。
+    struct Line: Identifiable, Sendable {
+        let id = UUID()
+        let mark: Mark
+        let key: String
+        let value: String
+        let fix: String?
+    }
+
+    struct Section: Identifiable, Sendable {
+        let id = UUID()
+        let title: String
+        var lines: [Line]
+    }
+
+    struct Result: Sendable {
+        let sections: [Section]
+        let failures: Int
+        let warnings: Int
+        let summary: String
     }
 
     private static var failures = 0
     private static var warnings = 0
+    /// 结构化结果的收集处，`section`/`line` 两个出口共同写入。
+    private static var collected: [Section] = []
+    /// 终端回显。窗口内取结构化结果，不该往 stdout 写。
+    private static var echo = true
+    /// 静态状态非重入，两个入口串行。
+    private static let gate = NSLock()
+
+    /// 窗口用的入口：跑同一套检查，返回结构化结果，不打印。
+    static func inspect(port: Int?) -> Result {
+        gate.lock()
+        defer { gate.unlock() }
+        echo = false
+        defer { echo = true }
+        _ = sweep(port: port)
+        return Result(sections: collected, failures: failures, warnings: warnings,
+                      summary: summaryText())
+    }
 
     static func run(port: Int?) -> Int32 {
+        gate.lock()
+        defer { gate.unlock() }
+        let code = sweep(port: port)
+        print("")
+        print(summaryText())
+        return code
+    }
+
+    private static func summaryText() -> String {
+        if failures > 0 {
+            return "结论：\(failures) 项失败，\(warnings) 项告警。实时百分比不可用时插件会自动转入推算模式。"
+        }
+        if warnings > 0 { return "结论：链路可用，\(warnings) 项告警。" }
+        return "结论：链路完整。"
+    }
+
+    private static func sweep(port: Int?) -> Int32 {
         failures = 0
         warnings = 0
+        collected = []
 
-        print("MiraQuota 自检\n")
+        if echo { print("MiraQuota 自检\n") }
 
         section("Mirasim 通道")
         let discovered = checkChannel(port: port)
@@ -33,14 +90,6 @@ enum Doctor {
         section("常驻")
         checkAgent()
 
-        print("")
-        if failures > 0 {
-            print("结论：\(failures) 项失败，\(warnings) 项告警。实时百分比不可用时插件会自动转入推算模式。")
-        } else if warnings > 0 {
-            print("结论：链路可用，\(warnings) 项告警。")
-        } else {
-            print("结论：链路完整。")
-        }
         _ = discovered
         return failures > 0 ? 1 : 0
     }
@@ -462,7 +511,8 @@ enum Doctor {
     // MARK: 输出
 
     private static func section(_ title: String) {
-        print("\u{001B}[2m\(title)\u{001B}[0m")
+        collected.append(Section(title: title, lines: []))
+        if echo { print("\u{001B}[2m\(title)\u{001B}[0m") }
     }
 
     private static func line(_ mark: Mark, _ key: String, _ value: String, fix: String? = nil) {
@@ -471,6 +521,9 @@ enum Doctor {
         case .warn: warnings += 1
         case .ok: break
         }
+        if collected.isEmpty { collected.append(Section(title: "", lines: [])) }
+        collected[collected.count - 1].lines.append(Line(mark: mark, key: key, value: value, fix: fix))
+        guard echo else { return }
         let color = mark == .ok ? "32" : (mark == .warn ? "33" : "31")
         print("  \u{001B}[\(color)m\(mark.rawValue)\u{001B}[0m \(pad(key, 14))\(value)")
         if let fix { print("    \u{001B}[2m→ \(fix)\u{001B}[0m") }

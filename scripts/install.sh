@@ -47,7 +47,8 @@ cat > "$PLIST" <<PLIST
 <dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>$BIN</string></array>
+  <!-- 登录时只常驻：不开窗口、不占 Dock。从 Dock 点图标才开窗。 -->
+  <array><string>$BIN</string><string>--background</string></array>
   <key>RunAtLoad</key><true/>
 $ENV_BLOCK
   <!-- 崩溃才拉起；从面板点「退出」是正常退出，保持退出状态直到下次登录。 -->
@@ -94,6 +95,7 @@ if [ -e "$LAUNCHER" ] || [ "${MIRAQUOTA_MAKE_LAUNCHER:-1}" = "1" ]; then
 fi
 
 echo "已安装 ${DEST}"
+echo "打开   open -a MiraQuota（首次打开后可在 Dock 图标上右键 → 选项 → 在 Dock 中保留）"
 echo "运行中 pid $(pgrep -x MiraQuota)"
 echo "自启   ${PLIST}（登录时拉起，崩溃自动重启）"
 echo "日志   ${LOG}"

@@ -157,6 +157,14 @@ struct PanelView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
+                Button("窗口") {
+                    NotificationCenter.default.post(name: AppDelegate.openWindowRequest, object: nil)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                // 与「退出」拉开距离：两者紧邻时，偏几个点的点击会把常驻进程关掉。
+                .padding(.trailing, 7)
                 Button("退出") { NSApplication.shared.terminate(nil) }
                     .buttonStyle(.plain)
                     .font(.system(size: 10.5))
@@ -219,7 +227,7 @@ private struct FrostBackground: NSViewRepresentable {
 /// 单个窗口：金额、百分比、带均速游标的进度条、重置倒计时。
 /// 金额主行按点数口径折算（`满额 × 百分比`），与百分比、进度条同分母；
 /// 本机账本支出落到副行，两者的差值反映当前窗口的用量构成与标定期不同。
-private struct WindowCard: View {
+struct WindowCard: View {
     let window: WindowReport
     let now: Date
     let measured: Bool
@@ -365,7 +373,7 @@ private struct WindowCard: View {
 }
 
 /// 卡片皮，窗口卡与速度卡共用。主窗口底色重一档。
-private extension View {
+extension View {
     func cardSkin(emphasis: Bool = false) -> some View {
         padding(.horizontal, 10)
             .padding(.vertical, 9)
@@ -382,7 +390,7 @@ private extension View {
 
 /// 按模型分行的出字速度与首 token 等待。出字速度只看最近几次请求，反映当下；
 /// 首 token 无法直接测量，由「时长 ≈ 首字等待 + 输出量 ÷ 出字速度」回归得出，故标 `≈`。
-private struct SpeedCard: View {
+struct SpeedCard: View {
     let report: SpeedReport
     let now: Date
 
@@ -417,19 +425,28 @@ private struct SpeedCard: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(report.rows, id: \.model) { row in
+                    // 四列定宽：模型名与数值列给最小宽度，偏离标与时刻才会逐行对齐。
+                    // 各段一律单行不折——数值折行会撑高行高，并把右侧两列推成参差。
                     HStack(spacing: 6) {
                         Text(row.model)
                             .font(.system(size: 10.5, weight: .medium))
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                             .frame(width: 60, alignment: .leading)
                         Text(Self.detail(row))
                             .font(.system(size: 10.5).monospacedDigit())
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .frame(minWidth: 112, alignment: .leading)
                         // 闸门由 SpeedStats 统一把关（样本 ≥3、幅度进 25% 出 18%、
                         // 当下值不超过基准三倍），两个显示面不各自定阈值。
                         if let drift = row.notableDrift {
                             Text(String(format: "%@%.0f%%", drift > 0 ? "快" : "慢", abs(drift)))
                                 .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
                                 .foregroundStyle(drift < 0 ? Color.warnTone : Color.okTone)
+                                .lineLimit(1)
+                                .fixedSize()
                                 .padding(.horizontal, 4)
                                 .padding(.vertical, 1)
                                 .background(Capsule().fill((drift < 0 ? Color.warnTone : Color.okTone).opacity(0.13)))
@@ -440,6 +457,8 @@ private struct SpeedCard: View {
                         Text(Formatting.age(now.timeIntervalSince(row.latestAt)) + "前")
                             .font(.system(size: 9.5, design: .monospaced))
                             .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .fixedSize()
                     }
                 }
             }
@@ -453,7 +472,8 @@ private struct SpeedCard: View {
             return String(format: "端到端 %.0f tok/s", row.endToEnd)
         }
         // 实测行的首 token 是逐请求测量值的中位数，不带 ≈；回归行才是截距估计。
-        let head = row.ttft.map { String(format: row.measured ? "首 %.1fs · " : "首 token ≈%.1fs · ", $0) } ?? ""
+        // 标签取 `首`（不写成 `首 token`）：340pt 面板宽下，带偏离标的行会因这 6 个字符折行。
+        let head = row.ttft.map { String(format: row.measured ? "首 %.1fs · " : "首 ≈%.1fs · ", $0) } ?? ""
         return head + String(format: "%.0f tok/s", rate)
     }
 
@@ -472,7 +492,7 @@ private struct SpeedCard: View {
     }
 }
 
-private struct ProgressBar: View {
+struct ProgressBar: View {
     let percent: Double
     let marker: Double?
     let tone: Color

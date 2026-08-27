@@ -27,11 +27,15 @@ echo "工具链 $DEV_DIR"
 
 DEVELOPER_DIR="$DEV_DIR" swift build -c release
 
+# 图标随构建重画，仓库里不留二进制资源。
+DEVELOPER_DIR="$DEV_DIR" xcrun swift scripts/make-icon.swift build >/dev/null
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/MiraQuota "$APP/Contents/MacOS/MiraQuota"
 # 客户端内控件的脚本，由注入器读取后经 CDP 送进 Mirasim 的渲染进程。
 cp widget/miraquota-widget.js "$APP/Contents/Resources/widget.js"
+cp build/icon.icns "$APP/Contents/Resources/icon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -41,12 +45,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>MiraQuota</string>
   <key>CFBundleIdentifier</key><string>local.miraquota</string>
   <key>CFBundleName</key><string>MiraQuota</string>
-  <key>CFBundleDisplayName</key><string>额度</string>
+  <key>CFBundleDisplayName</key><string>MiraQuota</string>
+  <key>CFBundleIconFile</key><string>icon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>0.3.0</string>
+  <key>CFBundleVersion</key><string>3</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
-  <key>LSUIElement</key><true/>
+  <!-- 不再声明 LSUIElement：这是可从 Dock 与启动台打开的常规应用。
+       登录时由 LaunchAgent 以 --background 拉起，那一路在进程内转为 .accessory，
+       不占 Dock，只留菜单栏项。 -->
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
@@ -57,3 +64,4 @@ codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
 
 echo "已生成 $APP"
 echo "启动：open $APP        自检：$APP/Contents/MacOS/MiraQuota --once"
+echo "常驻：$APP/Contents/MacOS/MiraQuota --background（不开窗口、不占 Dock）"
