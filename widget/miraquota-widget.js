@@ -183,7 +183,10 @@
   :host { all: initial; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   .root {
-    font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+    /* 控件跟着宿主跑，宿主在哪个平台就用哪一档系统字：Windows 上前两项都不存在，
+       落到 Segoe UI 与微软雅黑；只写苹方会让中文退到通用 sans-serif。 */
+    font-family: -apple-system, "SF Pro Text", "Segoe UI", "PingFang SC",
+      "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
     -webkit-font-smoothing: antialiased;
     --ink: rgba(255,255,255,.94); --ink2: rgba(255,255,255,.58); --ink3: rgba(255,255,255,.36);
     --bg: rgba(255,255,255,.08); --bgh: rgba(255,255,255,.15); --bd: rgba(255,255,255,.1);

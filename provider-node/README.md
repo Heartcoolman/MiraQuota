@@ -21,6 +21,19 @@ node provider-node/miraquota-provider.mjs --help        # 全部选项
 常驻方式按平台自理：Windows 用「计划任务」登录触发，Linux 用 systemd user unit，
 macOS 上直接用仓库主体的 Swift 版本。
 
+### Windows 上多一步：会话令牌要手工给
+
+现行 Mirasim 的 `/v1/limits` 要求带会话令牌，该令牌只存在于 Mirasim 拉起的会话进程的环境变量里。
+macOS 与 Linux 用 `ps eww` 读得到，Windows 的 `Get-CimInstance` 不暴露进程环境，
+`sessionTokens()` 在该平台直接返回空。所以 Windows 上要自行取到令牌并传进来：
+
+```powershell
+node provider-node\miraquota-provider.mjs --router-token <令牌>
+# 或 $env:MIRAQUOTA_ROUTER_TOKEN = '<令牌>'
+```
+
+不给令牌时 `/v1/limits` 取不到，provider 退回 relay 帧的百分比口径——分辨率 0.1%，没有额度点数。
+
 ## 覆盖范围
 
 | 有 | 无 |
@@ -56,3 +69,8 @@ relay 帧退路只走常规键名，不含 Swift 版的键名回退与有界深�
 未在 Windows 与 Linux 上实机验证：这两个平台的进程与端口枚举分别走
 `Get-CimInstance` + `netstat -ano` 与 `ps` + `ss -Hltnp`，代码在仓库里，
 但没有对应机器可跑。移植者先用 `--once` 确认端口发现，再起常驻。
+
+控件本身不含平台假设：它是纯 DOM 加 Shadow DOM，跑在 Mirasim 的渲染进程里，
+`backdrop-filter`、`-webkit-app-region`、`::-webkit-scrollbar` 在三个平台的 Chromium 上一致。
+字体栈已含 `Segoe UI` 与微软雅黑；标题栏吸附按宿主底色的连续段实测得出，不按写死的坐标，
+但各平台标题栏布局不同，吸附落位需实机核对。
