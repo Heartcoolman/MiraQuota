@@ -18,6 +18,10 @@
  * 均速游标改为出条上下各一像素，压在实色段上也分得清；
  * 有请求在途时胶囊上的点跟着跳，收起状态下也看得出正在生成。
  *
+ * v20 满额不可用时主行改用点数：兜底满额来自本机账本反推的每点美元，账本失真会把满额
+ * 同倍放大，而卡面只有一个 `~` 前缀。Swift 侧判出账本与点数不自洽即不再给 fullUSD，
+ * 此时把账本支出抬到主行同样不可信，故主行取点数，账本留在副行。
+ *
  * v15–v17 加标题栏吸附：宿主标题栏右侧本就排着自己的控件，控件贴右上角会压在上面。
  * 拖到标题栏空位附近即吸附（吸附位取「不与宿主控件重叠的最右一段空位」），
  * 之后随宿主布局变化（窗口缩放、标签增减）一起走。拖离即解除。
@@ -26,7 +30,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 19;
+  const VERSION = 20;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -826,7 +830,9 @@
     setText(els.lb1, winShort(primary.label));
     setText(els.v1, (primary.inferred ? '≈' : '') + pct(primary.usedPercent));
     setTone(els.v1, 'v', toneOf(primary.usedPercent));
-    setText(els.u1, usd(primary.scaledSpentUSD != null ? primary.scaledSpentUSD : primary.spentUSD));
+    setText(els.u1, primary.scaledSpentUSD == null && primary.fullUSD == null && primary.points
+      ? kilo(primary.points.used) + ' 点'
+      : usd(primary.scaledSpentUSD != null ? primary.scaledSpentUSD : primary.spentUSD));
 
     setHidden(els.sep, !second);
     setHidden(els.seg2, !second);
@@ -895,7 +901,10 @@
       setVar(c.el, '--i', String(i));
       setText(c.wl, winTitle(w.label));
       // 主行按点数口径折算，与百分比、进度条同分母；账本支出落到副行。
-      setText(c.amt, usd(w.scaledSpentUSD != null ? w.scaledSpentUSD : w.spentUSD));
+      // 满额不可用而点数在手时主行改用点数：此时账本已判定不自洽，不该被抬到主行。
+      const headPoints = w.scaledSpentUSD == null && w.fullUSD == null && w.points;
+      setText(c.amt, headPoints ? kilo(w.points.used) + ' 点'
+        : usd(w.scaledSpentUSD != null ? w.scaledSpentUSD : w.spentUSD));
       setText(c.full, '/ ' + (w.fullUSD == null ? '标定中'
         : (w.confidence === 'high' ? '' : '~') + usd(w.fullUSD)));
       setText(c.pc, (w.inferred ? '≈' : '') + pct(w.usedPercent));
@@ -926,7 +935,7 @@
       setTick(c.right, w.resetAt ? countdown(w.resetAt - now) : '无固定重置');
 
       const bits = [];
-      if (w.scaledSpentUSD != null) bits.push('账本 ' + usd(w.spentUSD));
+      if (w.scaledSpentUSD != null || headPoints) bits.push('账本 ' + usd(w.spentUSD));
       if (w.points) bits.push(`${kilo(w.points.used)}/${kilo(w.points.budget)} 点`);
       setText(c.sub, bits.join(' · '));
       setHidden(c.sub, !bits.length);
@@ -1030,9 +1039,11 @@
       setText(els.stamp, '');
       return;
     }
-    setHidden(els.rowFull, !d.unitPriceUSD);
+    setHidden(els.rowFull, !d.unitPriceUSD && !d.unitPriceNotice);
     if (d.unitPriceUSD) {
       setText(els.metaFull, `回归标定优先 · 兜底 额度点 × $${d.unitPriceUSD.toFixed(6)}`);
+    } else if (d.unitPriceNotice) {
+      setText(els.metaFull, d.unitPriceNotice);
     }
     // 只有 windows / capturedAt / state / stateLabel 是必填字段（见 docs/ARCHITECTURE.md），
     // 其余按有值的部分拼，缺项不显示——否则精简的 provider 会在这一行显示 undefined。

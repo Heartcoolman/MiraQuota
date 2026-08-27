@@ -45,6 +45,7 @@ provider 与 widget 之间只有 HTTP，没有共享文件、没有 IPC。widget
 | `pricing` | string | 价目表来源：`models.dev cache` 或 `builtin` |
 | `buckets` | number | 账本的分钟桶数量，仅作自检 |
 | `unitPriceUSD` | number? | 额度点单价，美元/点。由账本支出 ÷ 已用点数反推，取不到即缺省 |
+| `unitPriceNotice` | string? | 兜底单价停用的原因。逐窗口反推的每点美元离散超 4 倍即判账本与点数不自洽，此时 `unitPriceUSD` 缺省，界面在页脚显示本串 |
 | `accountNotice` | string? | 账号状态提示（`suspended` / `unmetered` / `degraded`） |
 | `windows` | array | 每个额度窗口一项，见下 |
 | `speed` | object? | 速度卡数据，见下 |
@@ -55,7 +56,7 @@ provider 与 widget 之间只有 HTTP，没有共享文件、没有 IPC。widget
 |---|---|---|
 | `label` | string | `5h` / `7d` / `7d_fable`。**窗口集合不固定，界面不得写死两个** |
 | `usedPercent` | number | 0–100。`inferred` 为真时是推算值 |
-| `scaledSpentUSD` | number? | 按点数口径折算的已用美元（`满额 × 百分比`），仅 exact/live 两级有值。**主行显示它**，与百分比、进度条同分母 |
+| `scaledSpentUSD` | number? | 按点数口径折算的已用美元（`满额 × 百分比`），仅 exact/live 两级有值。**主行显示它**，与百分比、进度条同分母；缺省而 `fullUSD` 也缺省时主行改显 `points.used`，账本支出不得抬到主行 |
 | `spentUSD` | number | 本机账本支出，作副行「账本 $x」 |
 | `fullUSD` | number? | 该窗口的满额，回归标定优先 |
 | `remainingUSD` | number? | 余额 |

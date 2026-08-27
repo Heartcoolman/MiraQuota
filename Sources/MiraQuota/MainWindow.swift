@@ -157,6 +157,8 @@ private struct MetaGrid: View {
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
                 if let unit = report.unitPriceUSD {
                     row("满额", "回归标定优先 · 兜底 额度点 × $" + String(format: "%.6f", unit))
+                } else if let notice = report.unitPriceNotice {
+                    row("满额", notice)
                 }
                 row("账本", "\(report.bucketCount) 分钟桶 · 本进程新增 \(report.newRecords) 条 · \(pricing)")
                 row("线路", [report.mode, report.host, report.relayStatus]

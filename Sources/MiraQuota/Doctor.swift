@@ -286,20 +286,39 @@ enum Doctor {
     /// 额度点单价，以及它与标定的对照。单价恒由已用点数最多的窗口（通常 7d）反推，
     /// 故该窗口上两者是同一个式子、必然吻合；其余窗口的差值反映的是跨窗口挪用单价的偏差。
     private static func checkUnitPrice(_ limits: LimitsSnapshot, ledger: CostLedger, calibrator: Calibrator) {
-        let now = Date()
-        var best: (label: String, points: Double, usd: Double)?
-        for w in limits.windows {
-            guard w.used >= 200, let start = w.quotaWindow.startAt else { continue }
-            let usd = ledger.spent(from: start, to: now, includeOpenMinute: true)
-            guard usd > 0 else { continue }
-            if best == nil || w.used > best!.points { best = (w.label, w.used, usd) }
+        let coherence = LedgerCoherence.evaluate(limits, ledger: ledger, now: Date())
+
+        // 账本与点数出自两条互不相干的通道（本地 transcript / 上游端点），
+        // 逐窗口反推的每点美元离散过大即说明至少一侧失真，且无从判定是哪一侧。
+        // 跨机器比对美元时这一项是先决条件：单价偏移会把该机全部满额同倍放大。
+        let rates = coherence.rates.map {
+            String(format: "%@ $%.4f/点（%.0f 点 / $%.2f）", $0.label, $0.perPoint, $0.points, $0.usd)
+        }.joined(separator: " · ")
+        if let spread = coherence.spread {
+            line(coherence.incoherent ? .warn : .ok, "账本自洽性",
+                 rates + String(format: " · 离散 %.1f×", spread),
+                 fix: coherence.incoherent
+                    ? String(format: "上限 %.0f×。", LedgerCoherence.maxSpread)
+                        + "账本超算（记录重复计入、历史记录落进当前分钟桶）"
+                        + "或点数漏计（部分请求不计入该订阅配额）均可致此，兜底单价已停用"
+                    : nil)
+        } else if !coherence.rates.isEmpty {
+            line(.ok, "账本自洽性",
+                 rates + String(format: " · 仅一个窗口达到交叉验证门槛 %.0f 点，本轮不判离散",
+                                LedgerCoherence.minPointsForCross))
         }
-        guard let best else {
-            line(.warn, "额度点单价", "已用点数不足 200，暂不反推单价",
-                 fix: "窗口刚重置时属常态，累积用量后自动给出；此前满额沿用回归标定")
+
+        guard let price = coherence.perPoint, let best = coherence.basis else {
+            if coherence.rates.isEmpty {
+                line(.warn, "额度点单价",
+                     String(format: "已用点数不足 %.0f，暂不反推单价", LedgerCoherence.minPoints),
+                     fix: "窗口刚重置时属常态，累积用量后自动给出；此前满额沿用回归标定")
+            } else {
+                line(.warn, "额度点单价", "已停用：账本与点数不自洽",
+                     fix: "满额只能由回归标定给出，标定未收敛的窗口显示「标定中」并改以点数为主行")
+            }
             return
         }
-        let price = best.usd / best.points
         line(.ok, "额度点单价",
              String(format: "$%.6f/点（按 %@ 窗口 %.0f 点 / $%.2f 反推）", price, best.label, best.points, best.usd))
         for w in limits.windows {

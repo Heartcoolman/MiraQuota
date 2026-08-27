@@ -47,7 +47,7 @@ node provider-node\miraquota-provider.mjs --router-token <令牌>
 
 缺的字段一律省略而不是填零。控件对此是容忍的：满额位置显示「标定中」，主行金额显示 `—`，
 速度卡整块不出现，页脚那一行按有值的部分拼。要补齐美元与速度，按契约文档的字段表填
-`scaledSpentUSD`、`spentUSD`、`fullUSD`、`unitPriceUSD`、`speed` 即可，控件侧不用改。
+`scaledSpentUSD`、`spentUSD`、`fullUSD`、`unitPriceUSD`、`unitPriceNotice`、`speed` 即可，控件侧不用改。
 
 relay 帧退路只走常规键名，不含 Swift 版的键名回退与有界深搜；刻度判定沿用「整帧证据」的做法
 （窗口与历史缓冲的取值全部落在 (0,1] 才按小数换算）。

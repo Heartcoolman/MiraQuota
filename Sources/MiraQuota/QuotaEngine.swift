@@ -18,8 +18,6 @@ final class QuotaEngine: ObservableObject {
     /// 心跳间隔，驱动倒计时、账本增量与降级判定。
     /// 取 5 秒是为了让速度卡跟得上请求落账；一轮重建只做增量尾读与几次二分查找。
     private static let heartbeat: TimeInterval = 5
-    /// 反推额度点单价所需的最少已用点数。点数太少时比值噪声过大。
-    private static let minPointsForRate: Double = 200
 
     private let work = DispatchQueue(label: "miraquota.engine")
     private let pricing: Pricing
@@ -127,7 +125,8 @@ final class QuotaEngine: ObservableObject {
         }
         let state = resolveState(now: now)
         let known = anchors.lastKnown
-        let rate = lastLimits.flatMap { unitPrice($0, now: now) }
+        let coherence = lastLimits.map { LedgerCoherence.evaluate($0, ledger: ledger, now: now) }
+        let rate = coherence?.perPoint
 
         let windows: [WindowReport]
         switch state {
@@ -155,6 +154,7 @@ final class QuotaEngine: ObservableObject {
             bucketCount: ledger.bucketCount,
             speed: speed.report(now: now),
             unitPriceUSD: rate,
+            unitPriceNotice: coherence.flatMap { LedgerCoherence.notice($0) },
             accountNotice: lastLimits?.notice
         )
         publish(latest)
@@ -259,23 +259,6 @@ final class QuotaEngine: ObservableObject {
             remainingUSD: fullUSD.map { max(0, $0 * (100 - w.usedPercent) / 100) },
             modelGroup: group
         )
-    }
-
-    /// 额度点单价，美元/点。取已用点数最多的窗口反推，各窗口共用同一取值：
-    /// 刚重置的窗口点数太少会失真。取值恒由 7d 反推，故 `rate × budget_7d` 与 7d 的
-    /// 百分比标定是同一个式子（支出 ÷ 百分比），两者吻合不构成互校。
-    private func unitPrice(_ limits: LimitsSnapshot, now: Date) -> Double? {
-        var best: (points: Double, usd: Double)?
-        for w in limits.windows {
-            guard !w.modelScoped, w.used >= Self.minPointsForRate,
-                  let start = w.quotaWindow.startAt else { continue }
-            // 已用点数含开分钟内的消耗（快照是即时值），美元不含会系统性压低单价。
-            let usd = ledger.spent(from: start, to: now, includeOpenMinute: true)
-            guard usd > 0 else { continue }
-            if best == nil || w.used > best!.points { best = (w.used, usd) }
-        }
-        guard let best else { return nil }
-        return best.usd / best.points
     }
 
     /// relay 实测：百分比直接采用，满额由标定反推。
@@ -412,6 +395,8 @@ final class QuotaEngine: ObservableObject {
         printSpeed(r.speed)
         if let price = r.unitPriceUSD {
             print(String(format: "单价     %.6f 美元/额度点（由账本支出 ÷ 已用点数反推）", price))
+        } else if let notice = r.unitPriceNotice {
+            print("单价     \(notice)")
         }
         if let notice = r.accountNotice { print("账号     \(notice)") }
         print("")

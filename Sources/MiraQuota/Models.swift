@@ -278,12 +278,14 @@ struct QuotaReport: Sendable {
     let speed: SpeedReport?
     /// 每额度点折算的美元，由「窗口内账本支出 ÷ 已用额度点」得出。
     let unitPriceUSD: Double?
+    /// 兜底单价停用的原因（账本与点数不自洽），可用时为 nil。
+    let unitPriceNotice: String?
     /// 账号状态提示（暂停 / 不计量 / 上游降级），正常时为 nil。
     let accountNotice: String?
 
     static func placeholder(_ state: ChannelState) -> QuotaReport {
         QuotaReport(windows: [], capturedAt: Date(), state: state, mode: "-", host: "-",
                     relayStatus: "-", newRecords: 0, bucketCount: 0, speed: nil,
-                    unitPriceUSD: nil, accountNotice: nil)
+                    unitPriceUSD: nil, unitPriceNotice: nil, accountNotice: nil)
     }
 }

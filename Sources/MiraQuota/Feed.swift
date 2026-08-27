@@ -255,6 +255,7 @@ final class Feed {
         if let detail = r.state.detail { root["detail"] = detail }
         if let notice = r.accountNotice { root["accountNotice"] = notice }
         if let price = r.unitPriceUSD { root["unitPriceUSD"] = price }
+        if let notice = r.unitPriceNotice { root["unitPriceNotice"] = notice }
         if let speed = r.speed { root["speed"] = self.speed(speed) }
         return root
     }

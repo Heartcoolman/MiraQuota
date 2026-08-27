@@ -143,6 +143,8 @@ struct PanelView: View {
             Divider()
             if let price = engine.report.unitPriceUSD {
                 metaRow("满额", String(format: "回归标定优先 · 兜底 额度点 × $%.6f", price))
+            } else if let notice = engine.report.unitPriceNotice {
+                metaRow("满额", notice)
             } else if !engine.report.windows.isEmpty {
                 metaRow("标定", calibrationLine)
             }
@@ -240,11 +242,11 @@ struct WindowCard: View {
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(width: 68, alignment: .leading)
-                Text(Formatting.usd(amount))
+                Text(headline.text)
                     .font(.system(size: primary ? 21 : 19, weight: .semibold, design: .rounded).monospacedDigit())
                     // 数字过渡只挂在按报告刷新的字段上；倒计时那类秒级走动的不挂，否则每秒抖一次。
-                    .contentTransition(.numericText(value: amount))
-                    .animation(.smooth(duration: 0.35), value: amount)
+                    .contentTransition(.numericText(value: headline.value))
+                    .animation(.smooth(duration: 0.35), value: headline.value)
                 Text(quotaSuffix)
                     .font(.system(size: 12, weight: .medium, design: .rounded).monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -279,8 +281,26 @@ struct WindowCard: View {
         .help(hint)
     }
 
-    /// 主行金额：按点数口径折算优先，推算级退回账本支出。
-    private var amount: Double { window.scaledSpentUSD ?? window.spentUSD }
+    /// 主行口径。折算值优先；满额不可用而点数在手时改用点数，
+    /// 不把此刻已判定不可信的账本支出抬到主行；两者都没有才退回账本。
+    private enum Headline {
+        case scaled(Double)
+        case points(Double)
+        case ledger(Double)
+    }
+
+    private var headline: (text: String, value: Double) {
+        switch headlineKind {
+        case .scaled(let v), .ledger(let v): return (Formatting.usd(v), v)
+        case .points(let v): return ("\(Formatting.kilo(v)) 点", v)
+        }
+    }
+
+    private var headlineKind: Headline {
+        if let scaled = window.scaledSpentUSD { return .scaled(scaled) }
+        if window.fullUSD == nil, let p = window.points { return .points(p.used) }
+        return .ledger(window.spentUSD)
+    }
 
     private var percentBadge: some View {
         Text((window.inferred ? "≈" : "") + String(format: "%.1f%%", window.usedPercent))
@@ -336,7 +356,8 @@ struct WindowCard: View {
 
     private var subText: String? {
         var bits: [String] = []
-        if window.scaledSpentUSD != nil {
+        // 主行已经是账本值时不再重复，其余情形都把账本支出留在副行。
+        if case .ledger = headlineKind {} else {
             bits.append("账本 \(Formatting.usd(window.spentUSD))")
         }
         if let p = window.points {
