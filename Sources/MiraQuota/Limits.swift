@@ -25,6 +25,9 @@ struct LimitsSnapshot: Sendable {
     let suspended: Bool
     let unmetered: Bool
     let degraded: Bool
+    /// 是否付费账号。内测账号为 false，额度按官方口径减半（见 `PlanRate`）；
+    /// 旧版端点不带该字段时为 nil，美元折算退回账本标定。
+    let paid: Bool?
 
     func window(_ label: String) -> Window? {
         windows.first { $0.label.caseInsensitiveCompare(label) == .orderedSame }
@@ -39,10 +42,19 @@ struct LimitsSnapshot: Sendable {
     }
 }
 
+/// 会话在路由端口上的入口。取自 Mirasim 拉起的会话进程环境：`ANTHROPIC_BASE_URL`
+/// 自 0.0.273 起带一段随机路径前缀，闸门按前缀放行、不再看令牌；0.0.235–0.0.272
+/// 则按 `x-api-key` 校验裸路径。两样都带上，哪一版都能过。
+struct SessionRoute: Sendable {
+    /// 不带尾斜杠的 base URL，`/v1/limits` 直接拼在后面。
+    let baseURL: String
+    let token: String?
+}
+
 /// `/v1/limits` 客户端。
 ///
 /// Mirasim 分给每个会话的回环端口（Claude Code 的 `ANTHROPIC_BASE_URL`）上挂着一个路由，
-/// `GET /v1/limits` 对本机免认证放行，回传 `windows[].{name, used, budget, reset_at}`。
+/// `GET <base>/v1/limits` 回传 `windows[].{name, used, budget, reset_at}`。
 /// `used` 带小数位，优于 relay 帧的 0.1% 分辨率；`reset_at` 与帧一致。
 /// 端点未公开（v0.0.220 实测可用），故只当主源用，取不到就退回 relay 帧。
 final class LimitsClient {
@@ -56,9 +68,8 @@ final class LimitsClient {
 
     private let lock = NSLock()
     private var cachedPort: Int?
-    /// 该端口配对的会话令牌。新版 Mirasim 的路由端口对 `/v1/limits` 也要求
-    /// `x-api-key`，令牌随会话存亡，故与端口一同缓存、一同失效。
-    private var cachedToken: String?
+    /// 该端口配对的会话入口（路径前缀与令牌）。两者随会话存亡，故与端口一同缓存、一同失效。
+    private var cachedRoute: SessionRoute?
     private var last: LimitsSnapshot?
     private var lastAttempt = Date.distantPast
     private var discoveryFailedAt = Date.distantPast
@@ -78,22 +89,22 @@ final class LimitsClient {
         }
         lastAttempt = now
         let port = cachedPort
-        let token = cachedToken
+        let route = cachedRoute
         let quietUntil = discoveryFailedAt.addingTimeInterval(Self.rediscoverAfter)
         lock.unlock()
 
         if Diag.forceOffline || Diag.noLimits { return nil }
 
-        var found = port.flatMap { Self.fetch(port: $0, token: token) }
+        var found = port.flatMap { Self.fetch(port: $0, route: route) }
         if found == nil, now.timeIntervalSince(quietUntil) >= 0 {
             let candidates = Self.routerPorts(anchor: anchorPort)
-            let tokens = candidates.isEmpty ? [:] : Self.sessionTokens()
+            let routes = candidates.isEmpty ? [:] : Self.sessionRoutes()
             for candidate in candidates where candidate != port {
-                if let s = Self.fetch(port: candidate, token: tokens[candidate]) {
+                if let s = Self.fetch(port: candidate, route: routes[candidate]) {
                     found = s
                     lock.lock()
                     cachedPort = candidate
-                    cachedToken = tokens[candidate]
+                    cachedRoute = routes[candidate]
                     lock.unlock()
                     break
                 }
@@ -111,7 +122,7 @@ final class LimitsClient {
         lock.lock()
         if found == nil {
             cachedPort = nil
-            cachedToken = nil
+            cachedRoute = nil
         } else {
             endpointConfirmed = true
         }
@@ -125,7 +136,7 @@ final class LimitsClient {
     func invalidate() {
         lock.lock()
         cachedPort = nil
-        cachedToken = nil
+        cachedRoute = nil
         last = nil
         discoveryFailedAt = .distantPast
         lastAttempt = .distantPast
@@ -140,13 +151,14 @@ final class LimitsClient {
 
     // MARK: 取值
 
-    private static func fetch(port: Int, token: String?) -> LimitsSnapshot? {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/limits") else { return nil }
+    private static func fetch(port: Int, route: SessionRoute?) -> LimitsSnapshot? {
+        // 没有会话入口的端口（预热槽）只能试裸路径；0.0.220 那版对本机免认证。
+        let base = route?.baseURL ?? "http://127.0.0.1:\(port)"
+        guard let url = URL(string: base + "/v1/limits") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
-        // 早期版本对本机免认证，新版按普通 API 请求鉴权。带上令牌两版都能过：
-        // 免认证的那版不看这个头。
-        if let token { request.setValue(token, forHTTPHeaderField: "x-api-key") }
+        // 按令牌校验的那几版看这个头，按前缀放行的版本不看，带上无害。
+        if let token = route?.token { request.setValue(token, forHTTPHeaderField: "x-api-key") }
         var payload: Data?
         let done = DispatchSemaphore(value: 0)
         URLSession.shared.dataTask(with: request) { data, response, _ in
@@ -180,7 +192,8 @@ final class LimitsClient {
         return LimitsSnapshot(windows: windows, capturedAt: Date(),
                               suspended: root["suspended"] as? Bool ?? false,
                               unmetered: root["unmetered"] as? Bool ?? false,
-                              degraded: root["degraded"] as? Bool ?? false)
+                              degraded: root["degraded"] as? Bool ?? false,
+                              paid: root["paid"] as? Bool)
     }
 
     private static func number(_ v: Any?) -> Double? {
@@ -228,30 +241,36 @@ final class LimitsClient {
         return Array(Set(ports)).sorted { a, b in (a == homePort ? 1 : 0) < (b == homePort ? 1 : 0) }
     }
 
-    /// 路由端口 → 会话令牌。令牌不落盘，只在 Mirasim 拉起的会话进程环境里：
-    /// 同一进程的 `ANTHROPIC_BASE_URL` 指向哪个回环端口，`ANTHROPIC_AUTH_TOKEN`
-    /// 就是那个端口的令牌。会话退出后端口与令牌一并消失，故每轮发现都重新读。
+    /// 路由端口 → 会话入口。前缀与令牌都不落盘，只在 Mirasim 拉起的会话进程环境里：
+    /// 同一进程的 `ANTHROPIC_BASE_URL` 指向哪个回环端口，它的路径与 `ANTHROPIC_AUTH_TOKEN`
+    /// 就是那个端口的入口；前缀与端口一一绑定，拿别的会话的前缀打本端口同样 401。
+    /// 会话退出后三者一并消失，故每轮发现都重新读。
     ///
     /// `ps` 必须用 `-U` 限定用户：BSD 语法下不给选择符时只列「同用户且同控制终端」的
     /// 进程，LaunchAgent 没有控制终端，结果会是空的。
-    static func sessionTokens() -> [Int: String] {
+    static func sessionRoutes() -> [Int: SessionRoute] {
         guard let text = run("/bin/ps", ["eww", "-U", NSUserName(), "-o", "command="]) else { return [:] }
 
         let urlPrefix = "ANTHROPIC_BASE_URL=http://127.0.0.1:"
-        var map: [Int: String] = [:]
+        var map: [Int: SessionRoute] = [:]
         for line in text.split(separator: "\n") {
             var port: Int?
+            var base: String?
             var token: String?
             // 逐个环境项精确匹配前缀：同一行还有 `MIRASIM_PTY_PIN_ANTHROPIC_BASE_URL`
             // 这类同名后缀的变量，子串匹配会配错。
             for field in line.split(separator: " ") {
                 if field.hasPrefix(urlPrefix) {
                     port = Int(field.dropFirst(urlPrefix.count).prefix { $0.isNumber })
+                    var value = String(field.dropFirst("ANTHROPIC_BASE_URL=".count))
+                    while value.hasSuffix("/") { value.removeLast() }
+                    base = value
                 } else if field.hasPrefix("ANTHROPIC_AUTH_TOKEN=") {
-                    token = String(field.dropFirst("ANTHROPIC_AUTH_TOKEN=".count))
+                    let t = String(field.dropFirst("ANTHROPIC_AUTH_TOKEN=".count))
+                    token = t.isEmpty ? nil : t
                 }
             }
-            if let port, let token, !token.isEmpty { map[port] = token }
+            if let port, let base { map[port] = SessionRoute(baseURL: base, token: token) }
         }
         return map
     }

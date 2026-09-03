@@ -182,12 +182,12 @@ enum Doctor {
     private static func checkLimits(frame: RelaySnapshot?, anchorPort: Int?) {
         let client = LimitsClient()
         guard let snapshot = client.snapshot(anchorPort: anchorPort) else {
-            let tokens = LimitsClient.sessionTokens().count
+            let routes = LimitsClient.sessionRoutes().count
             line(.warn, "额度原始值", "Mirasim 持有的回环端口上均无可读的 /v1/limits",
-                 fix: tokens == 0
-                     ? "新版路由端口要求会话令牌，令牌只存在于 Mirasim 拉起的会话进程里；"
+                 fix: routes == 0
+                     ? "新版路由端口按会话入口（路径前缀或令牌）放行，入口只存在于 Mirasim 拉起的会话进程里；"
                        + "当前没有这样的会话，插件退回 relay 帧的百分比（分辨率 0.1%）"
-                     : "会话令牌有 \(tokens) 份但都不被接受，或这版 Mirasim 没有该端点；"
+                     : "会话入口有 \(routes) 份但都不被接受，或这版 Mirasim 没有该端点；"
                        + "插件退回 relay 帧的百分比（分辨率 0.1%）")
             return
         }
@@ -216,12 +216,22 @@ enum Doctor {
 
     private static func checkLedger() {
         let fm = FileManager.default
+        let gatewayFiles = (try? fm.contentsOfDirectory(at: Paths.mirasimInsights,
+                                                         includingPropertiesForKeys: nil)) ?? []
+        let hasGatewayLedger = gatewayFiles.contains {
+            $0.lastPathComponent.hasPrefix("usage-") && $0.pathExtension == "ndjson"
+        }
         if fm.fileExists(atPath: Paths.claudeProjects.path) {
             let count = (try? fm.contentsOfDirectory(atPath: Paths.claudeProjects.path).count) ?? 0
             line(.ok, "transcript", "\(Paths.claudeProjects.path) · \(count) 个项目目录")
+        } else if hasGatewayLedger {
+            // OpenAI Codex 没有 Claude transcript，但它的模型、token 与耗时已在
+            // Mirasim 网关账本里；只缺 Claude transcript 不应把整个成本链判成坏的。
+            line(.warn, "transcript", "没有 Claude Code 会话记录；OpenAI Codex 等网关请求仍可计量",
+                 fix: "若要补齐 Claude Code 的消息级 token，请启动过 Claude Code 并保留 ~/.claude/projects")
         } else {
             line(.bad, "transcript", "\(Paths.claudeProjects.path) 不存在",
-                 fix: "没有 Claude Code 会话记录则无法计量支出")
+                 fix: "没有 Claude transcript 或 Mirasim 网关账本，无法计量支出")
         }
 
         let pricing = Pricing()
@@ -288,6 +298,31 @@ enum Doctor {
     private static func checkUnitPrice(_ limits: LimitsSnapshot, ledger: CostLedger, calibrator: Calibrator) {
         let coherence = LedgerCoherence.evaluate(limits, ledger: ledger, now: Date())
 
+        // 官方口径：套餐公布的每点美元，不依赖账本，只作对照、不进面板。账本反推与标定都按
+        // API 价目折算，上游对 Fable 5.1 按价目 2 倍扣点，差值反映的是两者之差。
+        if let paid = limits.paid, let planRate = PlanRate.usdPerPoint(paid: paid) {
+            var detail = PlanRate.note(paid: paid) + String(format: " = $%.4f/点", planRate)
+            if let ledgerRate = coherence.perPoint {
+                detail += String(format: " · 账本反推 $%.6f/点（差 %+.0f%%）",
+                                 ledgerRate, (ledgerRate - planRate) / planRate * 100)
+            }
+            line(.ok, "官方口径", detail)
+            for w in limits.windows {
+                let official = planRate * w.budget
+                guard let e = calibrator.estimate(label: w.label, ledger: ledger,
+                                                  budget: w.budget, group: w.modelGroup) else {
+                    line(.ok, "官方满额 \(w.label)", String(format: "$%.0f · 标定样本不足", official))
+                    continue
+                }
+                let gap = (e.fullUSD - official) / official * 100
+                line(.ok, "官方满额 \(w.label)",
+                     String(format: "$%.0f · 标定 $%.0f（%@，差 %+.0f%%）",
+                            official, e.fullUSD, e.basis.label as NSString, gap))
+            }
+        } else {
+            line(.ok, "官方口径", "/v1/limits 未给出 paid 标志，无官方参考值；面板满额一律由账本标定给出")
+        }
+
         // 账本与点数出自两条互不相干的通道（本地 transcript / 上游端点），
         // 逐窗口反推的每点美元离散过大即说明至少一侧失真，且无从判定是哪一侧。
         // 跨机器比对美元时这一项是先决条件：单价偏移会把该机全部满额同倍放大。
@@ -323,7 +358,9 @@ enum Doctor {
              String(format: "$%.6f/点（按 %@ 窗口 %.0f 点 / $%.2f 反推）", price, best.label, best.points, best.usd))
         for w in limits.windows {
             let fromPoints = price * w.budget
-            guard let e = calibrator.estimate(label: w.label, ledger: ledger, budget: w.budget)
+            // 档位窗口的标定必须按同档位过滤支出，配上全机支出会把满额抬高一倍。
+            guard let e = calibrator.estimate(label: w.label, ledger: ledger,
+                                              budget: w.budget, group: w.modelGroup)
             else { continue }
             let gap = abs(fromPoints - e.fullUSD) / fromPoints * 100
             // 「同式」只在该窗口既是单价来源、标定又走百分比口径时成立：
@@ -334,6 +371,9 @@ enum Doctor {
                                 fromPoints, e.fullUSD, e.basis.label, gap)
             if sameSource {
                 line(.ok, "满额对照 \(w.label)", detail + " · 单价由本窗口反推，同式")
+            } else if w.modelScoped {
+                // 全局单价来自通用窗口，档位窗口的差值含上游对该档位的计价系数，不作告警。
+                line(.ok, "满额对照 \(w.label)", detail + " · 档位窗口，差值含上游对该档位的计价系数")
             } else {
                 line(gap <= 30 ? .ok : .warn, "满额对照 \(w.label)", detail,
                      fix: gap > 30 ? "跨窗口挪用单价的常态偏差在 10–15%，超过 30% 需查账本漏记或标定样本跨预算点变更" : nil)
@@ -394,8 +434,8 @@ enum Doctor {
                 && (env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] as? String) != nil
         }
         if !envOK {
-            line(.warn, "实测通道", "~/.claude/settings.json 未注入 OTel env，新会话不上报逐请求实测",
-                 fix: "补齐 env：CLAUDE_CODE_ENABLE_TELEMETRY/ENHANCED_TELEMETRY_BETA=1、OTEL_TRACES_EXPORTER=otlp、http/json 指向 127.0.0.1:\(OtlpReceiver.port)")
+            line(.warn, "实测通道", "Claude Code 未注入 OTel env，新 Claude 会话不上报逐请求实测；OpenAI Codex 不依赖此设置",
+                 fix: "若需要 Claude 的逐请求实测，补齐 env：CLAUDE_CODE_ENABLE_TELEMETRY/ENHANCED_TELEMETRY_BETA=1、OTEL_TRACES_EXPORTER=otlp、http/json 指向 127.0.0.1:\(OtlpReceiver.port)")
         }
         if fetch("http://127.0.0.1:\(OtlpReceiver.port)/health") == nil {
             line(.warn, "实测接收端", "127.0.0.1:\(OtlpReceiver.port) 无响应",
@@ -420,7 +460,7 @@ enum Doctor {
             line(.ok, "实测样本", "48 小时内 \(count) 条 · 最新 \(age)前")
         } else {
             line(.warn, "实测样本", "48 小时内无实测记录，速度卡将回落到回归估计",
-                 fix: "env 注入后需重启 CC 会话才生效；Mirasim 派生会话不经此通道，属预期")
+                 fix: "Claude 的 env 注入后需重启会话才生效；OpenAI Codex 与 Mirasim 派生会话使用网关回归，属预期")
         }
     }
 

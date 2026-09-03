@@ -42,8 +42,8 @@ MiraQuota 由三部分组成：
 <ul>
 <li><b>$13.9 / $244</b>：折算后的已用金额与当前窗口满额（<code>满额 × 用量百分比</code>）</li>
 <li><b>进度条上的竖线</b>：均速游标；用量条越过它表示消耗快于线性速率</li>
-<li><b>账本 $30.9 · 8922/157k 点</b>：副行的另一套口径——本机账本支出与原始额度点数</li>
-<li><b>≈2.9 天后打满</b>：按当前速率外推；若到重置仍不会打满则显示「到重置不满」</li>
+<li><b>账本 $30.9 · 8922/157k 点</b>：副行的另一套口径——本机账本按 API 价目折算的支出，与原始额度点数</li>
+<li><b>≈2.9 天后打满</b>：按近 1 小时点增速外推；若到重置仍不会打满则显示「到重置不满」。7d 的外推分两段：Fable 子窗口到顶后只按其余模型的增速，Fable 用得再快也不会把 7d 预测成几小时后打满</li>
 <li><b>速度卡</b>：出字速度与首 token 等待的回归估计；有请求在途时标记「生成中」</li>
 <li><b>右上角的「精确」</b>：当前数据通道级别，共五级，见<a href="#数据降级">数据降级</a></li>
 <li><b>底部两行</b>：满额取得方式、额度点单价、账本桶数与 relay 线路状态</li>
@@ -90,10 +90,10 @@ node provider-node/miraquota-provider.mjs   # Windows / Linux：跨平台参考 
 | 项 | 要求 |
 |---|---|
 | 宿主 | Mirasim 桌面版在本机运行，并以 `--remote-debugging-port` 启动（`scripts/mirasim-debug.sh` 或 `install.sh` 生成的启动器均可）。不带该参数时控件不出现，仅菜单栏可用 |
-| Mirasim 版本 | `/v1/limits` 端点在 v0.0.220 上验证可用，现行版本需附会话令牌（取自会话进程环境，见「数据来源」）；更早版本没有该端点时，自动退回 relay 帧的百分比口径 |
+| Mirasim 版本 | `/v1/limits` 端点在 v0.0.220 上验证可用，现行版本需附会话入口（0.0.273 起为 base URL 里的随机路径前缀，此前为会话令牌；均取自会话进程环境，见「数据来源」）；更早版本没有该端点时，自动退回 relay 帧的百分比口径 |
 | 操作系统 | 完整版 provider 需要 macOS 14 或更新（Apple Silicon 与 Intel 均可，在本机构建本机架构）。Windows / Linux 使用 [provider-node/](provider-node/)，仅需 Node 22+，无需构建 |
 | 构建环境 | 完整 Xcode 16 或更新（Swift 6 工具链）。仅装 Command Line Tools 无法编译，SwiftUI 的宏插件不在其中。`bundle.sh` 依次探测 `DEVELOPER_DIR`、`xcode-select -p`、`/Applications/Xcode*.app`，找不到完整 Xcode 时报错退出 |
-| 美元口径 | 由本机账本折算。账本取自 `~/.claude/projects/*/*.jsonl`（Claude Code）与 `~/.mirasim/insights/usage-*.ndjson`（Mirasim 网关）；两处均为空时点数与百分比照常显示，仅美元金额与单价缺失 |
+| 美元口径 | 满额与已用金额由账本标定折算，与账本同口径；账本支出由本机账本按 Anthropic 公开价目折算，取自 `~/.claude/projects/*/*.jsonl`（Claude Code）与 `~/.mirasim/insights/usage-*.ndjson`（Mirasim 网关，含 OpenAI Codex）；两处均为空时点数与百分比照常显示，仅美元金额与单价缺失 |
 
 本项目不提供预编译包：未经开发者签名的下载包会被 Gatekeeper 隔离，需手动移除隔离属性才能运行；
 本地构建由 `bundle.sh` 做 ad-hoc 签名，不存在此问题。因此安装路径只有一条——克隆仓库后自行构建。
@@ -220,14 +220,18 @@ Mirasim 渲染进程中执行 JS。不希望如此的话，不运行 `mirasim-de
 
 | 数据 | 来源 | 说明 |
 |---|---|---|
-| 已用额度点、总额度、重置时刻 | `http://127.0.0.1:<路由端口>/v1/limits` | 原始值，`used` 带小数位；需会话令牌 |
+| 已用额度点、总额度、重置时刻 | `<会话 ANTHROPIC_BASE_URL>/v1/limits` | 原始值，`used` 带小数位；需会话入口（路径前缀或令牌） |
 | 额度百分比、重置时刻（退路） | `ws://127.0.0.1:<port>/mirachannel/ws` 的 `getRelay` 帧 | 与 Mirasim 界面同源，分辨率 0.1% |
 | 等价支出 | `~/.claude/projects/*/*.jsonl` | Claude Code 全量 token，含 cache 分量与 model |
-| 等价支出（补充） | `~/.mirasim/insights/usage-*.ndjson` | 补充 pi-gui 等不经 Claude Code 的智能体 |
+| 等价支出（网关） | `~/.mirasim/insights/usage-*.ndjson` | 补充不写 Claude transcript 的请求，包括 OpenAI Codex 的 `openai-responses` |
 | 价目表 | `~/.mirasim/models-dev-cache.json` | 缺失时回退到内置表 |
 | 请求时长 | `~/.mirasim/insights/usage-*.ndjson` 的 `durationMs` | 单次请求总耗时，用于速度回归 |
 | 在途请求 | `~/.mirasim/diag/ev-*.ndjson` 的 `model.begin` / `model.end` | 请求发出即落盘，用于「生成中」标记 |
 | 实测首字节 | `~/.mirasim/analytics/events-*.ndjson` 的 `turn.finish.props.ttfbMs` | 仅覆盖图形界面发起的对话，只作量级对照 |
+
+成本账本目前识别 Anthropic 的 Claude 请求和 OpenAI 的 `openai-responses` / `openai-chat` 网关记录。
+OpenAI Codex 的 token、耗时和模型名直接取网关记录；没有对应的 Claude transcript 时不会漏掉这部分支出。
+OpenAI 的美元数仍是公开 API 价目表下的等价金额，不代表 ChatGPT/Codex 订阅账单中的实际扣款。
 
 `/v1/limits` 挂载在 Mirasim 为每个会话分配的回环端口上（即 Claude Code 通过
 `ANTHROPIC_BASE_URL` 使用的端口），返回 `windows[].{name, used, budget, reset_at}`
@@ -236,11 +240,13 @@ Mirasim 渲染进程中执行 JS。不希望如此的话，不运行 `mirasim-de
 是为了在同时运行开发实例时避免读到另一账号的额度。该做法由
 [chiakinanam1/mirasim-quota-widget](https://github.com/chiakinanam1/mirasim-quota-widget) 提供。
 
-早期版本对本机连接免认证，现行版本按普通 API 请求鉴权，缺 `x-api-key` 回 401。
-令牌不落盘，只存在于 Mirasim 拉起的会话进程环境里：同一进程的 `ANTHROPIC_BASE_URL`
-指向哪个回环端口，`ANTHROPIC_AUTH_TOKEN` 就是该端口的令牌，按端口配对即可。
-枚举用 `ps eww -U <当前用户>`——不给用户选择符时只列「同用户且同控制终端」的进程，
-LaunchAgent 没有控制终端，结果会是空的。没有活跃会话时取不到令牌，该级降级为帧口径。
+早期版本对本机连接免认证；0.0.235–0.0.272 按普通 API 请求鉴权，缺 `x-api-key` 回 401；
+0.0.273 起改为按 URL 路径放行：`ANTHROPIC_BASE_URL` 形如 `http://127.0.0.1:<端口>/<随机前缀>`，
+裸路径无论带不带令牌都 401，带前缀则不看令牌，且前缀与端口一一绑定。前缀与令牌都不落盘，
+只存在于 Mirasim 拉起的会话进程环境里，故直接取该进程的 `ANTHROPIC_BASE_URL` 整段作 base、
+`ANTHROPIC_AUTH_TOKEN` 作令牌，按端口配对，两种闸门都能过。
+枚举用 `ps eww -U <当前用户>`；不给用户选择符时只列「同用户且同控制终端」的进程，
+LaunchAgent 没有控制终端，结果会是空的。没有活跃会话时取不到入口，该级降级为帧口径。
 
 远端同名端点不可用：`https://relay.mirasim.ai/v1/limits` 要求 `device.privateKey` 的签名头，
 仅凭 `setting.json` 中的 auth token 返回 401。网关账本中的
@@ -253,10 +259,25 @@ LaunchAgent 没有控制终端，结果会是空的。没有活跃会话时取�
 ## 满额标定
 
 **主路径：读取原始值后折算。** `/v1/limits` 直接给出已用与总额的额度点数，百分比即 `used / budget`，
-无需反推。美元数字仍需折算，折算的单价由标定给出。
+无需反推。美元数字仍需折算，折算的单价优先取官方口径，其次由标定给出。
+
+**折算口径取账本标定，官方口径只作对照。** Mirasim 公布的套餐额度以美元计：MAX 40X 的 7 天额度为 $5600，
+同一账号 `/v1/limits` 的 7d 预算点为 560000，即 1 点 = $0.01（各档位的预算点按同一比例缩放）；
+`/v1/limits` 的 `paid` 为 false 时为内测账号，额度减半，折成每点 $0.005。该口径下的满额（本机实测 5h $784、
+7d $2800、7d_fable $1484）是 Mirasim 扣点单位的美元值，与按 Anthropic 价目记账的账本不同口径，故不进面板，
+只在 `--doctor` 的「官方口径 / 官方满额」两行作对照；面板的满额与主行由下述标定给出，与账本同口径。
+账本按 Anthropic 公开价目折算，与 Mirasim「流量监控」页的估算成本同口径；上游扣点对各模型另有倍率：
+以 Mirasim 网关账本对 `7d_fable` 点序列做 10 分钟分箱回归（2026-09-03，247 次调用，R² 0.998），Fable 5.1 的
+输入、输出、缓存读、缓存写四类均按价目的 2 倍扣点；Opus 5 在全部截点为 195–214 点/美元，按价目扣点。
+故 Fable 用量占比越高，账本行越低于主行（纯 Fable 时约为一半），账本标定也随之混算而系统性偏低
+（实测 7d 满额 $2072 对 $2800）。`--doctor` 的「官方口径 / 官方满额」两行并列输出官方值与标定值。
+7d_fable 窗口的预算点为 7d 的 53%，对应 Anthropic 对 Fable「不超过周额度一半」的规则，由端点直接给出。
 
 面板上 `$22.0 / $536` 的分母是该窗口自身的标定满额，`4.1%` 是点数比值、与美元无关，
 分子 = 分母 × 百分比，三个数字在卡面上保持自洽。本机账本支出另列一行。
+「余」在 7d 上按分段单价折算：Fable 子窗口还能吃掉的点按 Fable 单价，其余点按其它模型单价——Fable 到顶后
+剩余点只能由 Opus 使用，每点值约翻倍，单一混合单价会把余额低估近半——故 7d 的主行加余额不必等于满额，
+`--once` 的「余额分段」行给出两段的点数与单价。
 
 **标定口径一：点数。** 满额 = 「一段时间内的支出 ÷ 同期点数增量」× 预算点数。点数是绝对量，
 跨预算点变更仍可比，分辨率也高于百分比。`/v1/limits` 可读时走这一路。乘上去的预算点必须取
@@ -362,7 +383,10 @@ LaunchAgent 没有控制终端，结果会是空的。没有活跃会话时取�
 
 请求尚在流式传输、未完成时，速度卡顶部显示脉冲点与「生成中 N 条 · 正在生成：已 M 秒」。
 数据来自诊断事件流 `~/.mirasim/diag/ev-*.ndjson`：`model.begin` 在请求发出瞬间落盘，
-`model.end` 在完成时落盘，按 `callId` 配对，未闭合的即为在途。中断的请求不发 `end`，
+`model.end` 在完成时落盘，按 `callId` 配对，未闭合的即为在途。Claude 使用
+`/v1/messages`，OpenAI Codex 使用 `/backend-api/codex/responses`；直连 OpenAI 的
+`/v1/responses` 与 `/v1/chat/completions` 也会被识别，两者共用这条通道。
+中断的请求不发 `end`，
 在途超过 10 分钟即判定为已弃（已闭合请求的 95 分位时长 46 秒，最长 383 秒）。
 有请求在途时控件轮询间隔降至 2 秒，「已 M 秒」逐秒走动；请求完成后，
 出字速度随下一次账本落账更新。响应流式过程中本机没有可用的 token 计数，
@@ -376,7 +400,8 @@ LaunchAgent 没有控制终端，结果会是空的。没有活跃会话时取�
 
 **显示名与分模型**
 
-账本中是 `claude-opus-5`、`claude-opus-4-8`、`claude-haiku-4-5-20251001` 这类原始模型名，
+账本中是 `claude-opus-5`、`claude-opus-4-8`、`claude-haiku-4-5-20251001`、
+`gpt-5.6-sol` 这类原始模型名，
 界面显示为 `Opus 5`、`Opus 4.8`、`Haiku 4.5`（去掉 `claude-` 前缀与快照日期，
 族名首字母大写，版本号用点连接）。版本段不是纯数字时（如 `gpt-5.6-sol`）原样保留，不做猜测性拼接。
 混合模型的统计明显偏移（全模型合计 1.4s / 60 tok/s，仅取 opus-5 为 4.5s / 81 tok/s），
@@ -404,7 +429,7 @@ LaunchAgent 没有控制终端，结果会是空的。没有活跃会话时取�
 | 取什么 | 来源 | 关联键 |
 |---|---|---|
 | 关联枢纽、模型、时刻 | `insights/usage-*.ndjson`（尾部重扫 1 MB，按 `id` 去重） | — |
-| 输出 token（即时） | `~/.claude/projects/*/*.jsonl` 的 `message.usage.output_tokens` | 账本 `providerCallId` == transcript `requestId` |
+| 输出 token（即时） | Claude 取 `~/.claude/projects/*/*.jsonl` 的 `message.usage.output_tokens`；OpenAI Codex 直接取网关账本 | Claude 账本 `providerCallId` == transcript `requestId`；OpenAI 以网关 `id` / `providerCallId` 计入 |
 | 请求时长（即时） | `diag/ev-*.ndjson` 的 `model.end.durationMs` | 账本 `id` 冒号后半段 == diag `callId` |
 
 回填后的记录中，账本 `output` 与 transcript token 逐条相等（134/159/292/987），口径一致；
@@ -538,7 +563,9 @@ launchctl kickstart -k gui/$(id -u)/local.miraquota
 标定出的满额反映的是「本机实际能用到的份额」，低于独占订阅的理论满额。
 
 **额度点与美元是两套单位。** `used` / `budget` 是 Mirasim 自己的计量单位，百分比由二者相除得出，
-与美元无关。美元数字依赖账本折算，单价、满额、已用金额都继承账本自身的偏差。
+与美元无关。账本按 Anthropic 公开价目折算，与 Mirasim「流量监控」页的估算成本同口径；满额与主行由账本标定给出，
+亦为该口径。上游对 Fable 5.1 按价目 2 倍扣点，故 `--doctor` 中按官方每点美元算出的满额高于标定满额，
+Fable 用量占比越高差距越大；单价、满额、已用金额都继承账本自身的偏差。
 `/v1/limits` 未公开，Mirasim 改动后可能失效，届时自动退回帧口径。
 
 **绝对金额偏低，占比不受影响。** 长上下文溢价未建模，美元数字整体偏低；
@@ -579,7 +606,7 @@ launchctl kickstart -k gui/$(id -u)/local.miraquota
 
 | 路径 | 内容 |
 |---|---|
-| `~/.miraquota/ledger.json` | transcript 读取游标、分钟级成本桶、requestId 去重表、网关账本的按 id 账目（保留 8 天） |
+| `~/.miraquota/ledger.json` | transcript 读取游标、分钟级成本桶、requestId 去重表、网关账本的按 id 账目（保留 8 天）；带折算口径版本号，口径变更后启动时清空并从磁盘重建 |
 | `~/.miraquota/calibration.json` | 百分比样本序列（保留 14 天，每窗口上限 4000 条） |
 | `~/.miraquota/calibration.lock` | 标定落盘的文件锁，防止常驻实例与 `--once` 并发写时互相覆盖 |
 | `~/.miraquota/anchor.json` | 最后一次实测的窗口锚点，供离线推算；未锁定的取值不覆盖已锁定边界 |

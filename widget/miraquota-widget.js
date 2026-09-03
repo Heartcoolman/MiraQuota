@@ -22,6 +22,9 @@
  * 同倍放大，而卡面只有一个 `~` 前缀。Swift 侧判出账本与点数不自洽即不再给 fullUSD，
  * 此时把账本支出抬到主行同样不可信，故主行取点数，账本留在副行。
  *
+ * v21 满额可取官方口径（macOS provider 自 2026-09-03 起不再下发 planRateUSD，满额回归账本标定；分支保留给其它 provider）：provider 给出 planRateUSD（套餐公布的每点美元，内测减半）时，
+ * 满额与主行都由它折算，账本反推的单价退到页脚作对照。
+ *
  * v15–v17 加标题栏吸附：宿主标题栏右侧本就排着自己的控件，控件贴右上角会压在上面。
  * 拖到标题栏空位附近即吸附（吸附位取「不与宿主控件重叠的最右一段空位」），
  * 之后随宿主布局变化（窗口缩放、标签增减）一起走。拖离即解除。
@@ -1039,8 +1042,13 @@
       setText(els.stamp, '');
       return;
     }
-    setHidden(els.rowFull, !d.unitPriceUSD && !d.unitPriceNotice);
-    if (d.unitPriceUSD) {
+    setHidden(els.rowFull, !d.planRateUSD && !d.unitPriceUSD && !d.unitPriceNotice);
+    if (d.planRateUSD) {
+      // 官方口径优先；账本反推并列，两者之差即上游扣点倍率与 API 价目之差
+      let text = `${d.planRateNote || '官方口径'} · 额度点 × $${d.planRateUSD.toFixed(4)}`;
+      if (d.unitPriceUSD) text += ` · 账本反推 $${d.unitPriceUSD.toFixed(6)}`;
+      setText(els.metaFull, text);
+    } else if (d.unitPriceUSD) {
       setText(els.metaFull, `回归标定优先 · 兜底 额度点 × $${d.unitPriceUSD.toFixed(6)}`);
     } else if (d.unitPriceNotice) {
       setText(els.metaFull, d.unitPriceNotice);

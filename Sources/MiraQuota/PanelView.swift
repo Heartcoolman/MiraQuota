@@ -501,7 +501,7 @@ struct SpeedCard: View {
     private var hint: String {
         var lines = [
             "出字速度取最近 \(report.recentCount) 次请求，按 token 加权，并对显示值做一阶平滑",
-            "实测行（首 token 不带 ≈）：Claude Code OTel trace 逐请求上报首 token 与时长",
+            "实测行（首 token 不带 ≈）：Claude Code 的 OTel trace 逐请求上报首 token 与时长；OpenAI Codex 使用网关回归",
             "回归行（首 token 带 ≈）：账本只有总时长，首 token 取 48 小时样本的回归截距",
             "常态基准为同路径样本的出字速度；端到端为输出量除以总时长，含首字等待",
         ]

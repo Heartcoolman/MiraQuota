@@ -3,8 +3,10 @@ import Foundation
 /// 成本账本：增量扫描 Claude Code 的 transcript 与 Mirasim 的网关账本，
 /// 把每次调用的 token 折算成 API 等价美元，按分钟聚合。
 ///
-/// 两个来源都不完备，故取并集，用 Anthropic 的 request id 跨源去重
-/// （transcript 的 `requestId` 即网关账本的 `providerCallId`）：
+/// 两个来源都不完备，故取并集。Anthropic 的 Claude 请求用 transcript 与网关账本
+/// 的 request id 跨源去重（transcript 的 `requestId` 即网关账本的
+/// `providerCallId`）；OpenAI Codex 请求没有对应的本地 transcript，直接以网关账本
+/// 的请求 id 计入。
 ///
 /// - transcript 的 token 完整、可回溯全部历史，但只记录写回会话的助手消息。
 ///   标题生成、被丢弃的响应、文件已被清理的子代理会话都不在其中，本机实测
@@ -30,7 +32,14 @@ final class CostLedger {
         var usd: Double
     }
 
+    /// 账本的折算口径版本。桶与账目只存金额、不留 token，价目口径一变，已落账的金额无法
+    /// 原地改算，只能清掉游标与账目从磁盘重建（transcript 可回溯全部历史，网关账本首扫整读）。
+    /// 1：API 价目；2、3：曾按上游扣点倍率折算（Fable 5.1 × 2，已回退）；4：回到 API 价目。
+    static let pricingVersion = 4
+
     private struct Persisted: Codable {
+        /// 落盘时的折算口径，缺省即版本 1。理由同 `booked`，必须是 Optional。
+        var pricingVersion: Int? = nil
         var cursors: [String: Cursor] = [:]
         /// unix 分钟 → 美元
         var buckets: [String: Double] = [:]
@@ -85,6 +94,7 @@ final class CostLedger {
         // 没有状态文件时 load 直接返回，这里兜住：账目表为 nil 时下面所有
         // `state.booked?[key] = …` 都会静默丢弃，两侧的补差额随之失效。
         if state.booked == nil { state.booked = [:] }
+        if state.pricingVersion == nil { state.pricingVersion = Self.pricingVersion }
     }
 
     // MARK: 持久化
@@ -94,12 +104,29 @@ final class CostLedger {
               let p = try? JSONDecoder().decode(Persisted.self, from: data) else { return }
         state = p
         if state.booked == nil { state.booked = [:] }
+        if (state.pricingVersion ?? 1) != Self.pricingVersion { rebuild() }
+        // 已声明过的档位组从盘面恢复：`refresh` 先于 `adoptScopedGroups` 运行，进程启动后
+        // 第一轮解析的记录若不知道分组就永远进不了档位桶（游标随即落盘）。常驻实例与
+        // --once/--doctor 每次启动都漏一段，实测 7d_fable 的档位支出因此低四成。
+        scopedGroups = (state.scopedSince ?? [:]).keys.sorted()
         // 旧状态的网关账目按账本行 id 记账，并入统一的账目键，升级后不重复计入。
         for (id, entry) in state.gateway ?? [:] where state.booked?[id] == nil {
             state.seen[id] = entry.minute
             state.booked?[id] = entry.usd
         }
         state.gateway = nil
+    }
+
+    /// 折算口径变更后清掉全部金额与游标，保留档位组声明，下一轮 `refresh` 从磁盘重建。
+    /// 重建时档位组自始已知，分桶覆盖整个保留期，故各组的起点一并前移到保留期起点。
+    private func rebuild() {
+        let since = (Int(Date().timeIntervalSince1970) - Int(Self.retention)) / 60
+        var fresh = Persisted()
+        fresh.pricingVersion = Self.pricingVersion
+        fresh.booked = [:]
+        fresh.scoped = [:]
+        fresh.scopedSince = (state.scopedSince ?? [:]).mapValues { _ in since }
+        state = fresh
     }
 
     private func save() {
@@ -174,7 +201,7 @@ final class CostLedger {
                 let n = raw.count
                 var start = 0, i = 0
                 var firstLine = true
-                Self.anthropicNeedle.withUnsafeBufferPointer { pat in
+                Self.gatewayProviderNeedle.withUnsafeBufferPointer { pat in
                     while i < n {
                         guard bytes[i] == 0x0A else { i += 1; continue }
                         let length = i - start
@@ -196,7 +223,9 @@ final class CostLedger {
     /// 行级预筛关键字。首次建账要过 1 GB 量级的 transcript，
     /// 只有命中的行才值得付 JSON 解析的代价。
     private static let usageNeedle = Array("\"usage\"".utf8)
-    private static let anthropicNeedle = Array("\"anthropic\"".utf8)
+    /// 网关账本同时包含 Anthropic、OpenAI 和其它请求；先按 provider 预筛，
+    /// 再由 `parseGatewayLine` 只接受本项目支持的两类上游。
+    private static let gatewayProviderNeedle = Array("\"provider\"".utf8)
 
     /// 从游标处读入新增字节并逐行解析。文件被截断时游标归零，
     /// 重复计入由 requestId 去重拦下。
@@ -287,7 +316,8 @@ final class CostLedger {
         guard let root = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               let ts = root["ts"] as? String,
               let epoch = fastEpochSeconds(ts), epoch >= cutoff,
-              (root["provider"] as? String) == "anthropic" else { return false }
+              let provider = root["provider"] as? String,
+              provider == "anthropic" || provider == "openai" || provider.hasPrefix("openai-") else { return false }
         guard let id = root["id"] as? String else { return false }
 
         // 账目键优先取 providerCallId：它与 transcript 的 requestId 同值，
@@ -299,22 +329,32 @@ final class CostLedger {
         if prior == nil {
             // 有 seen 无金额：旧版按字节游标入过账，无从补差，跳过防止重复计入。
             if state.seen[key] != nil { return false }
-            // 缺 providerCallId 的行无法与 transcript 对齐（本机占全部行的 0.5%）：
-            // claude / codex 的调用另有 transcript 覆盖，宁可漏计也不重复计。
+            // Anthropic 的 Claude 行缺 providerCallId 时无法与 transcript 对齐，
+            // 仍按旧口径交给 transcript 覆盖，宁可漏计也不重复计。OpenAI Codex
+            // 没有对应 transcript，必须保留其无 providerCallId 的网关行。
             let agent = (root["agent"] as? String) ?? ""
-            if providerCallId == nil, agent == "claude" || agent == "codex" { return false }
+            if provider == "anthropic", providerCallId == nil,
+               agent == "claude" || agent == "codex" { return false }
         }
 
         let model = (root["model"] as? String) ?? ""
-        let usd = model.isEmpty ? nil : pricing.cost(model: model,
-                                                     input: int(root["input"]),
-                                                     output: int(root["output"]),
-                                                     cacheRead: int(root["cacheRead"]),
-                                                     cacheWrite: int(root["cacheWrite"]))
+        let input = int(root["input"])
+        let output = int(root["output"])
+        let cacheRead = int(root["cacheRead"])
+        let cacheWrite = int(root["cacheWrite"])
+        let hasTokens = input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0
+        // OpenAI 的早期 `openai-chat` 记录可能没有模型和 token（只代表一次
+        // 请求尝试，不是可计费调用），跳过且不把它们误报成未定价。
+        guard !model.isEmpty else {
+            if hasTokens, countedUnpriced.insert(id).inserted { unpricedRecords += 1 }
+            return false
+        }
+        let usd = pricing.cost(model: model, input: input, output: output,
+                               cacheRead: cacheRead, cacheWrite: cacheWrite)
         // cost 对零 token 的已知模型返回 0.0 而非 nil——token 未回填的行
         // 此刻既不入账也不记已见，等回填后重读，这正是旧游标口径丢钱的病根。
         guard let usd, usd > 0 else {
-            if countedUnpriced.insert(id).inserted { unpricedRecords += 1 }
+            if hasTokens, countedUnpriced.insert(id).inserted { unpricedRecords += 1 }
             return false
         }
         if let prior {

@@ -317,7 +317,8 @@ final class SpeedStats {
     }
 
     /// 从 Claude Code 的 transcript 尾部取 token。transcript 是追加型、请求完成即写，
-    /// 不依赖 relay 回填，是「当下」token 的唯一即时来源。
+    /// 不依赖 relay 回填，是 Claude 请求的「当下」token 来源；OpenAI Codex 的 token
+    /// 已随网关记录写入，不需要这条补齐路径。
     /// 关联键：账本的 `providerCallId` 就是 transcript 的 `requestId`（实测逐条相等）。
     private func backfillFromTranscripts() {
         let wanted = Set(samples.filter { $0.out < Self.minOutput && !$0.requestId.isEmpty }
@@ -425,7 +426,7 @@ final class SpeedStats {
             // 重启后重读毒行变成崩溃循环，须走 first。
             guard (root["method"] as? String) == "POST",
                   let path = root["path"] as? String,
-                  path.split(separator: "?").first == "/v1/messages",
+                  Self.isGenerationPath(path),
                   let ts = root["ts"] as? String,
                   let at = fastEpochSeconds(ts) else { return }
             flights[callId] = at
@@ -435,6 +436,16 @@ final class SpeedStats {
         default:
             break
         }
+    }
+
+    /// Claude Code 使用 Anthropic 的 `/v1/messages`，Codex 使用 Mirasim 的
+    /// `/backend-api/codex/responses`；直连 OpenAI 客户端常见的
+    /// `/v1/responses` 与 `/v1/chat/completions` 也属于生成请求。
+    /// 这些请求都会在诊断流里成对写入 begin/end，因此可以共用在途与即时耗时的处理。
+    private static func isGenerationPath(_ raw: String) -> Bool {
+        let path = raw.split(separator: "?", maxSplits: 1).first.map(String.init) ?? raw
+        return path == "/v1/messages" || path == "/backend-api/codex/responses"
+            || path == "/v1/responses" || path == "/v1/chat/completions"
     }
 
     /// 从游标处读入新增字节并逐行解析，返回游标是否因文件缩小而重置。
@@ -704,7 +715,7 @@ final class SpeedStats {
         return row
     }
 
-    /// 按会话分行：每个 Claude Code 窗口是一个会话，状态栏据此只显示
+    /// 按会话分行：每个客户端窗口是一个会话，状态栏据此只显示
     /// 本窗口的速度，不被并行窗口的高频请求顶掉。只用实测样本
     /// （span 带 session.id，账本没有会话身份），会话中途换模型时
     /// 只取最近模型的样本，避免混合模型偏移。不做显示平滑：

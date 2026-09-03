@@ -33,6 +33,8 @@ node provider-node\miraquota-provider.mjs --router-token <令牌>
 ```
 
 不给令牌时 `/v1/limits` 取不到，provider 退回 relay 帧的百分比口径——分辨率 0.1%，没有额度点数。
+如果机器上只有 OpenAI Codex 会话而没有 Claude 会话，通常也拿不到挂在
+`ANTHROPIC_BASE_URL` 上的路由令牌；此时按同样的 relay 百分比退回是预期行为。
 
 ## 覆盖范围
 
@@ -48,6 +50,9 @@ node provider-node\miraquota-provider.mjs --router-token <令牌>
 缺的字段一律省略而不是填零。控件对此是容忍的：满额位置显示「标定中」，主行金额显示 `—`，
 速度卡整块不出现，页脚那一行按有值的部分拼。要补齐美元与速度，按契约文档的字段表填
 `scaledSpentUSD`、`spentUSD`、`fullUSD`、`unitPriceUSD`、`unitPriceNotice`、`speed` 即可，控件侧不用改。
+
+macOS 完整版的成本账本已经同时识别 Claude 和 OpenAI Codex 的网关记录；本 Node 参考实现仍只
+提供额度点与百分比，不读取账本、不计算美元。
 
 relay 帧退路只走常规键名，不含 Swift 版的键名回退与有界深搜；刻度判定沿用「整帧证据」的做法
 （窗口与历史缓冲的取值全部落在 (0,1] 才按小数换算）。

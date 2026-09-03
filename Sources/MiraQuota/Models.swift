@@ -169,7 +169,10 @@ struct WindowReport: Sendable {
     /// 按近 1 小时点增速外推的打满秒数，无消耗或观测不足时为 nil。
     var etaSeconds: Double? = nil
     /// 剩余可用的美元估计：满额 ×（100 − 已用百分比），满额未知时为 nil。
+    /// 有子窗口的父窗口（7d 之于 7d_fable）按分段单价折算，此时不等于满额减主行，见 `remainingNote`。
     var remainingUSD: Double? = nil
+    /// 分段折算的说明（档位点数 × 档位单价 + 其余点数 × 其余单价），只在 `--once` 打印，不下发。
+    var remainingNote: String? = nil
     /// 该窗口只计某一模型档位的用量时的档位组名（实测 `fable`），通用窗口为 nil。
     /// 这类窗口的 `spentUSD` 只含同档位模型的支出，与全机支出不同口径。
     var modelGroup: String? = nil
@@ -188,7 +191,7 @@ struct PointBalance: Sendable {
 
 /// 单个模型的速度估计：首 token 取保留期内的回归值，出字速度只取最近几次请求。
 struct SpeedRow: Sendable {
-    /// 去掉 `claude-` 前缀的短名。
+    /// 去掉 provider 前缀后的短名；Claude 的 `claude-` 前缀也会去掉。
     let model: String
     /// 参与出字速度计算的最近请求数。
     let samples: Int
@@ -228,11 +231,11 @@ struct SpeedRow: Sendable {
     }
 }
 
-/// 单个 Claude Code 会话（窗口）的速度估计。只有实测路径可得：
+/// 单个客户端会话（窗口）的速度估计。只有实测路径可得：
 /// OTel span 自带 `session.id`，网关账本没有会话身份。
 /// 状态栏据此按窗口取数，多窗口并行时互不串行。
 struct SessionSpeedRow: Sendable {
-    /// Claude Code 的会话 UUID，与 transcript 文件名一致。
+    /// 客户端的会话 UUID；Claude 时与 transcript 文件名一致。
     let session: String
     /// 会话内最近一次请求的模型短名。
     let model: String

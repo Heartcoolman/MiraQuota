@@ -213,7 +213,7 @@ private struct SpeedPane: View {
     }
 }
 
-/// 按会话分行。同一台机器上并行开着几个 Claude Code 窗口时，模型行会被
+/// 按会话分行。同一台机器上并行开着几个客户端窗口时，模型行会被
 /// 请求最频繁的那个窗口顶掉，这张表按会话拆开，各窗口互不遮盖。
 private struct SessionTable: View {
     let rows: [SessionSpeedRow]
@@ -270,7 +270,7 @@ private struct Provenance: View {
 
     private var notes: [String] {
         var out = [
-            "实测行（首 token 不带 ≈）：Claude Code 的 OTel trace 逐请求上报首 token 与时长",
+            "实测行（首 token 不带 ≈）：Claude Code 的 OTel trace 逐请求上报首 token 与时长；OpenAI Codex 使用网关回归",
             "回归行（首 token 带 ≈）：网关账本只有总时长，首 token 取 48 小时样本的回归截距",
             "出字速度取最近 \(speed.recentCount) 次请求按 token 加权，测的是客户端观测到的投递速率",
             "近期通过筛选的请求 \(speed.sampleTotal) 次",

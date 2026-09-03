@@ -19,6 +19,7 @@ widget（widget/miraquota-widget.js，Shadow DOM，纯 JS，无外部依赖）
 
 provider 与 widget 之间只有 HTTP，没有共享文件、没有 IPC。widget 不读磁盘，
 也读不到磁盘：渲染进程取不到 `~/.claude/projects` 与网关账本，美元与速度只能由 provider 喂。
+macOS provider 的网关账本同时覆盖 Claude 与 OpenAI Codex 请求。
 
 ## 契约 A：数据 feed
 
@@ -44,7 +45,7 @@ provider 与 widget 之间只有 HTTP，没有共享文件、没有 IPC。widget
 | `mode` / `host` / `relayStatus` | string | 线路、relay 主机、relay 状态 |
 | `pricing` | string | 价目表来源：`models.dev cache` 或 `builtin` |
 | `buckets` | number | 账本的分钟桶数量，仅作自检 |
-| `unitPriceUSD` | number? | 额度点单价，美元/点。由账本支出 ÷ 已用点数反推，取不到即缺省 |
+| `unitPriceUSD` | number? | 额度点单价，美元/点。由账本支出 ÷ 已用点数反推，取不到即缺省。账本按 API 价目折算，Fable 用量占比高时低于官方口径 |
 | `unitPriceNotice` | string? | 兜底单价停用的原因。逐窗口反推的每点美元离散超 4 倍即判账本与点数不自洽，此时 `unitPriceUSD` 缺省，界面在页脚显示本串 |
 | `accountNotice` | string? | 账号状态提示（`suspended` / `unmetered` / `degraded`） |
 | `windows` | array | 每个额度窗口一项，见下 |
@@ -57,13 +58,13 @@ provider 与 widget 之间只有 HTTP，没有共享文件、没有 IPC。widget
 | `label` | string | `5h` / `7d` / `7d_fable`。**窗口集合不固定，界面不得写死两个** |
 | `usedPercent` | number | 0–100。`inferred` 为真时是推算值 |
 | `scaledSpentUSD` | number? | 按点数口径折算的已用美元（`满额 × 百分比`），仅 exact/live 两级有值。**主行显示它**，与百分比、进度条同分母；缺省而 `fullUSD` 也缺省时主行改显 `points.used`，账本支出不得抬到主行 |
-| `spentUSD` | number | 本机账本支出，作副行「账本 $x」 |
-| `fullUSD` | number? | 该窗口的满额，回归标定优先 |
-| `remainingUSD` | number? | 余额 |
+| `spentUSD` | number | 本机账本支出，按 Anthropic 公开价目折算（与 Mirasim 流量监控页同口径），作副行「账本 $x」 |
+| `fullUSD` | number? | 该窗口的满额，官方口径优先，其次回归标定 |
+| `remainingUSD` | number? | 余额。有子窗口的父窗口（7d 之于 7d_fable）按分段单价折算：子窗口还能吃掉的点按该档位单价，其余点按其它模型单价，故不必等于 `fullUSD − scaledSpentUSD` |
 | `points` | object? | `{used, budget}`，来自 `/v1/limits` 的原始额度点 |
 | `resetAt` | number? | 重置时刻，unix 秒 |
 | `pacePercent` / `paceDelta` | number? | 均速游标位置与偏离 |
-| `etaSeconds` | number? | 按当前速度打满所需秒数 |
+| `etaSeconds` | number? | 按近 1 小时点增速外推的打满秒数。父窗口分两段：子窗口到顶后只按其余模型的增速；其余增速为零时给出大于重置剩余时长的值，界面据此显示「到重置不满」 |
 | `confidence` | string | 标定置信度 |
 | `inferred` | bool | 真值表示百分比来自推算，界面须加 `≈` |
 

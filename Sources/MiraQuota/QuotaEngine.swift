@@ -131,7 +131,8 @@ final class QuotaEngine: ObservableObject {
         let windows: [WindowReport]
         switch state {
         case .exact:
-            windows = (lastLimits?.windows ?? []).map { exact($0, rate: rate, snapshot: lastSnapshot, now: now) }
+            let all = lastLimits?.windows ?? []
+            windows = all.map { exact($0, siblings: all, rate: rate, snapshot: lastSnapshot, now: now) }
         case .live, .stale:
             let snap = lastSnapshot
             windows = (snap?.windows ?? []).map { measured($0, snapshot: snap, now: now) }
@@ -203,24 +204,74 @@ final class QuotaEngine: ObservableObject {
         }
     }
 
-    /// 按近 1 小时点增速外推的打满秒数。轨迹只取当前窗口期内（重置时刻一致）的观测，
-    /// 跨度不足 3 分钟或增速为零时不给数。窗口重置后旧轨迹自然失配，从头积累。
-    private func etaSeconds(_ w: LimitsSnapshot.Window, now: Date) -> Double? {
+    /// 子窗口：与父窗口同一重置时刻、名字以「父名_」开头的 modelScoped 窗口（`7d` 之于 `7d_fable`）。
+    /// 子窗口的点是父窗口点的子集（实测 7d 已用 ≥ 7d_fable 已用，Opus-only 区间只有 7d 在涨）；
+    /// 子窗口到顶后该档位被上游拒绝，父窗口此后只剩其余模型的消耗。
+    private static func child(of w: LimitsSnapshot.Window,
+                              in all: [LimitsSnapshot.Window]) -> LimitsSnapshot.Window? {
+        guard !w.modelScoped else { return nil }
+        return all.first { $0.modelScoped && $0.resetAt == w.resetAt && $0.label.hasPrefix(w.label + "_") }
+    }
+
+    /// 近 1 小时轨迹的点增速（点/秒）与末次已用点数。轨迹只取当前窗口期内（重置时刻一致）的观测，
+    /// 跨度不足 3 分钟不给数。窗口重置后旧轨迹自然失配，从头积累。
+    private func trailRate(_ w: LimitsSnapshot.Window, now: Date) -> (perSecond: Double, used: Double)? {
         let trail = (pointsTrail[w.label] ?? []).filter {
             $0.resetAt == w.resetAt && now.timeIntervalSince($0.at) <= 3600
         }
         guard let first = trail.first, let last = trail.last,
               last.at.timeIntervalSince(first.at) >= 180 else { return nil }
-        let rate = (last.used - first.used) / last.at.timeIntervalSince(first.at)
-        guard rate > 0 else { return nil }
-        return (w.budget - last.used) / rate
+        return ((last.used - first.used) / last.at.timeIntervalSince(first.at), last.used)
+    }
+
+    /// 按近 1 小时点增速外推的打满秒数，增速为零时不给数。有子窗口的父窗口分两段：
+    /// 子窗口到顶之前按合计增速，之后只按其余模型的增速——直线外推会把 Fable 占九成的时段
+    /// 算成 7d 几小时后打满，而 7d_fable 的预算只有 7d 的 53%，Fable 到顶后 7d 的增速随即回落。
+    /// 其余增速为零即到重置不满，返回重置剩余时长加一小时：两个显示面都按 now + eta ≥ resetAt 判「到重置不满」，
+    /// 余量让快照采集时刻与外推时刻的时差不至于把它判回「打满」。
+    private func etaSeconds(_ w: LimitsSnapshot.Window, child: LimitsSnapshot.Window?, now: Date) -> Double? {
+        guard let whole = trailRate(w, now: now), whole.perSecond > 0 else { return nil }
+        let remaining = w.budget - whole.used
+        guard let child, let part = trailRate(child, now: now), part.perSecond > 0 else {
+            return remaining / whole.perSecond
+        }
+        let untilChildFull = max(0, child.budget - part.used) / part.perSecond
+        if whole.perSecond * untilChildFull >= remaining { return remaining / whole.perSecond }
+        let rest = whole.perSecond - part.perSecond
+        guard rest > 0 else { return max(0, w.resetAt.timeIntervalSince(now)) + 3600 }
+        return untilChildFull + (remaining - whole.perSecond * untilChildFull) / rest
+    }
+
+    /// 有子窗口的父窗口，剩余点数分两段折算：子窗口还能吃掉的点按该档位单价，其余点按其它模型单价。
+    /// 单一混合单价会在 Fable 占比高时把余额低估近半：Fable 到顶后剩余点只能由 Opus 使用，每点值翻倍。
+    /// 档位单价优先取子窗口自己的标定，未收敛时用窗口起点以来的档位支出 ÷ 档位点数；
+    /// 其余单价 = （全机支出 − 档位支出）÷（父点数 − 子点数）。任一侧点数不足即退回混合口径。
+    private func splitRemaining(_ w: LimitsSnapshot.Window, child: LimitsSnapshot.Window,
+                                start: Date?, now: Date) -> (usd: Double, note: String)? {
+        guard let start, let group = child.modelGroup else { return nil }
+        let childSpent = ledger.spent(from: start, to: now, includeOpenMinute: true, group: group)
+        let allSpent = ledger.spent(from: start, to: now, includeOpenMinute: true)
+        let restPoints = w.used - child.used
+        guard child.used >= LedgerCoherence.minPoints, childSpent > 0,
+              restPoints >= LedgerCoherence.minPoints, allSpent > childSpent else { return nil }
+        let childRate = calibrator.estimate(label: child.label, ledger: ledger, budget: child.budget, group: group)
+            .flatMap { $0.confidence == .high || $0.confidence == .medium ? $0.fullUSD / child.budget : nil }
+            ?? childSpent / child.used
+        let restRate = (allSpent - childSpent) / restPoints
+        let remaining = max(0, w.budget - w.used)
+        let viaChild = min(remaining, max(0, child.budget - child.used))
+        let note = String(format: "%@ %.1fk 点 × $%.4f + 其余 %.1fk 点 × $%.4f",
+                          group as NSString, viaChild / 1000, childRate, (remaining - viaChild) / 1000, restRate)
+        return (viaChild * childRate + (remaining - viaChild) * restRate, note)
     }
 
     /// `/v1/limits` 精确值：百分比为 `used / budget`，满额折美元按窗口自己的标定优先。
+    /// 官方口径（`PlanRate`）是 Mirasim 扣点单位的美元值，与按 API 价目记账的账本不同口径，
+    /// 不进主行，只在 `--doctor` 作对照。
     /// 各窗口的点是同一单位（实测 Δ5h点/Δ7d点 恒在 1.0 附近），但每点美元随时段的模型混比
     /// 与缓存读占比漂移，实测跨 $0.00235–0.00502。全局单价由已用点数最多的窗口反推（恒为 7d），
     /// 因而只对该窗口成立：挪到 5h 上实测偏高约 12%。故仅在标定未收敛时作兜底，且标为低置信。
-    private func exact(_ w: LimitsSnapshot.Window, rate: Double?,
+    private func exact(_ w: LimitsSnapshot.Window, siblings: [LimitsSnapshot.Window], rate: Double?,
                        snapshot: RelaySnapshot?, now: Date) -> WindowReport {
         let bounds = w.quotaWindow
         let start = bounds.startAt
@@ -242,6 +293,8 @@ final class QuotaEngine: ObservableObject {
             fullUSD = estimate?.fullUSD
             confidence = estimate?.confidence ?? .none
         }
+        let child = Self.child(of: w, in: siblings)
+        let split = child.flatMap { splitRemaining(w, child: $0, start: start, now: now) }
         return WindowReport(
             label: w.label,
             usedPercent: w.usedPercent,
@@ -255,8 +308,9 @@ final class QuotaEngine: ObservableObject {
             trend: snapshot?.trend(for: w.label) ?? [],
             points: PointBalance(used: w.used, budget: w.budget),
             scaledSpentUSD: fullUSD.map { $0 * w.usedPercent / 100 },
-            etaSeconds: etaSeconds(w, now: now),
-            remainingUSD: fullUSD.map { max(0, $0 * (100 - w.usedPercent) / 100) },
+            etaSeconds: etaSeconds(w, child: child, now: now),
+            remainingUSD: split?.usd ?? fullUSD.map { max(0, $0 * (100 - w.usedPercent) / 100) },
+            remainingNote: split?.note,
             modelGroup: group
         )
     }
@@ -415,8 +469,12 @@ final class QuotaEngine: ObservableObject {
                 print(String(format: "      额度点 %.1f / %.0f", p.used, p.budget))
             }
             if let rem = w.remainingUSD {
-                let eta = w.etaSeconds.map { String(format: " · 按近 1 小时点增速 ≈%.1f 小时后满", $0 / 3600) } ?? ""
+                let eta = w.etaSeconds.map { eta -> String in
+                    if let reset = w.resetAt, eta >= reset.timeIntervalSince(r.capturedAt) { return " · 到重置不满" }
+                    return String(format: " · 按近 1 小时点增速 ≈%.1f 小时后满", eta / 3600)
+                } ?? ""
                 print(String(format: "      余 $%.0f%@", rem, eta))
+                if let note = w.remainingNote { print("      余额分段 \(note)") }
             }
             if let reset = w.resetAt {
                 print("      重置 \(Self.stamp.string(from: reset))")
