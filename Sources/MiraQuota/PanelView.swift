@@ -299,6 +299,13 @@ struct WindowCard: View {
                     .padding(.top, 4)
             }
 
+            if let mix = mixLine {
+                mix
+                    .font(.system(size: 9.5).monospacedDigit())
+                    .lineLimit(1)
+                    .padding(.top, 2)
+            }
+
             if let sub = subText {
                 Text(sub)
                     .font(.system(size: 9.5).monospacedDigit())
@@ -427,6 +434,19 @@ struct WindowCard: View {
         return bits.isEmpty ? nil : bits.joined(separator: " · ")
     }
 
+    /// 按用法：近期混用多个模型时，按各模型支出比例折出的余额。
+    private var mixLine: Text? {
+        guard window.head != nil, let m = window.mix else { return nil }
+        var line = Text("按用法 ").foregroundColor(.secondary.opacity(0.7))
+            + Text("~\(Formatting.usd(m.remainingUSD))").foregroundColor(.secondary)
+        if m.estimated {
+            line = line + Text("\u{00A0}估").font(.system(size: 8.5, weight: .semibold)).foregroundColor(.warnTone)
+        }
+        // 只列占比最高的两个，其余归「等」：模型一多整行被截，截掉的恰是后面的名字。
+        let parts = m.shares.prefix(2).map { "\($0.name) \(Int(($0.share * 100).rounded()))%" }.joined(separator: " · ")
+        return line + Text(" · \(m.span) \(parts)\(m.shares.count > 2 ? " 等" : "")").foregroundColor(.secondary.opacity(0.7))
+    }
+
     /// 换用：同一点数池按其余模型各自的扣点率折出的余额，最多三个。「估」「待测」用橙色小字。
     /// 项内用不换行空格：折行只落在各项之间，不把模型名与它的余额拆到两行。
     private var altLine: Text? {
@@ -460,6 +480,11 @@ struct WindowCard: View {
                 let left = m.remainingUSD.map { " ≈ \(Formatting.usd($0))" } ?? ""
                 lines.append("\(m.current ? "▶ " : "")\(m.name) · \(rate) · 本窗口已扣 \(Formatting.kilo(m.usedPoints)) 点"
                              + " · 账本 \(Formatting.usd(m.usedUSD)) · 余 \(Formatting.kilo(m.remainingPoints)) 点\(left)")
+            }
+            if let mix = window.mix {
+                lines.append(String(format: "按%@用法每 $1 平均扣 %.1f 点，余 ≈ %@：", mix.span, mix.pointsPerUSD,
+                                    Formatting.usd(mix.remainingUSD))
+                             + mix.shares.map { String(format: "%@ %.1f%%", $0.name, $0.share * 100) }.joined(separator: " · "))
             }
             if let reset = window.resetAt { lines.append("重置于 " + PanelView.clock.string(from: reset)) }
             return lines.joined(separator: "\n")

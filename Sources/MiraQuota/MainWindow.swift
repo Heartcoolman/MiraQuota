@@ -156,6 +156,7 @@ private struct ModelTable: View {
         let day = r.measuredAt.map { MainWindowFormat.day.string(from: $0) } ?? ""
         switch r.source {
         case .measured: return "实测"
+        case .measuring: return "实测中 $" + String(format: "%.2f", r.evidenceUSD)
         case .lastMeasured: return "上次实测 \(day)"
         case .estimated: return "估" + (r.relErr.map { String(format: " ±%.0f%%", $0 * 100) } ?? "")
         case .unknown: return "待测"
@@ -185,6 +186,11 @@ private struct ModelTable: View {
            let orate = other.pointsPerUSD {
             text += String(format: "；换用 %@（每 $1 扣 %.0f 点%@）约合 %@", other.name, orate,
                            other.tag.map { "，\($0)" } ?? "", Formatting.usd(left / orate))
+        }
+        if let mix = w.mix {
+            let parts = mix.shares.prefix(3).map { "\($0.name) \(Int(($0.share * 100).rounded()))%" }.joined(separator: "、")
+            text += String(format: "；照%@的用法（%@），每 $1 平均扣 %.0f 点，约合 %@%@", mix.span, parts,
+                           mix.pointsPerUSD, Formatting.usd(mix.remainingUSD), mix.estimated ? "（估）" : "")
         }
         return text + "。已扣掉的点不会因为换模型而退回，换用后按新模型的扣点率继续扣。"
     }

@@ -5,6 +5,8 @@ struct ModelRate: Sendable {
     enum Source: String, Sendable {
         /// 近 72 小时点数样本实测。
         case measured
+        /// 刚用上、证据未达实测门槛：实时比值与先验按证据量加权，随用量增加收敛到实测值。
+        case measuring
         /// 存档里的实测值，锚点模型的扣点率此后未明显变化。
         case lastMeasured
         /// 由存档按锚点变化换算，或由历史百分比样本回归出的相对倍率推算。
@@ -28,6 +30,7 @@ struct ModelRate: Sendable {
     var tag: String? {
         switch source {
         case .estimated: return "估"
+        case .measuring: return "实测中"
         case .unknown: return "待测"
         default: return nil
         }
@@ -135,6 +138,9 @@ final class PointRates {
     static let settle = 300
     static let span: TimeInterval = 72 * 3600
     static let halfLife: TimeInterval = 24 * 3600
+    /// 实测中的先验权重，单位美元：新比值与先验按「本模型证据 $ : 该值」加权。取实测门槛同值，
+    /// 证据达到门槛时新比值占一半，过门槛即纯用实测。
+    static let priorWeightUSD = 0.5
 
     private(set) var table: [String: ModelRate] = [:]
     private(set) var tree: QuotaTree?
@@ -168,7 +174,8 @@ final class PointRates {
 
     func refresh(limits: LimitsSnapshot, calibrator: Calibrator, ledger: CostLedger,
                  pricing: Pricing, now: Date = Date()) {
-        if let lastRun, now.timeIntervalSince(lastRun) < 60, tree != nil { return }
+        // 30 秒一轮：点数样本最短 30 秒一条，再快没有新数据。
+        if let lastRun, now.timeIntervalSince(lastRun) < 30, tree != nil { return }
         lastRun = now
         anchorKey = pricing.rosterDefault.map(pricing.key(for:)) ?? anchorKey
         let spendAll = ledger.spendByModel(from: now.addingTimeInterval(-CostLedger.retention), to: now,
@@ -302,7 +309,8 @@ final class PointRates {
             for (k, v) in b.x { raw[k, default: 0] += v; active[k, default: 0] += 1 }
         }
         let total = raw.values.reduce(0, +)
-        let material = raw.filter { $0.value >= max(0.10, 0.03 * total) }.keys.sorted()
+        // 门槛放到 2 美分：刚用上的模型也要进拟合，才能给出「实测中」的实时值。
+        let material = raw.filter { $0.value >= max(0.02, 0.03 * total) }.keys.sorted()
         guard !material.isEmpty else { return [] }
         let range = Self.dayRange(span.0, span.1)
 
@@ -318,10 +326,12 @@ final class PointRates {
             guard sx > 0 else { return [] }
             let r = max(0, sy / sx)
             let usd = raw[m] ?? 0, pts = r * usd, n = active[m] ?? 0
-            guard usd >= 0.5, pts >= 50, n >= 2 else { return [] }
-            return [ModelRate(key: m, pointsPerUSD: r, source: .measured,
-                              note: String(format: "实测 · %@ · $%.2f · %.0f 点 · %d 箱", range, usd, pts, n),
-                              measuredAt: now, evidenceUSD: usd, evidencePoints: pts, bins: n, relErr: nil)]
+            if usd >= 0.5, pts >= 50, n >= 2 {
+                return [ModelRate(key: m, pointsPerUSD: r, source: .measured,
+                                  note: String(format: "实测 · %@ · $%.2f · %.0f 点 · %d 箱", range, usd, pts, n),
+                                  measuredAt: now, evidenceUSD: usd, evidencePoints: pts, bins: n, relErr: nil)]
+            }
+            return provisional(m, observed: r, usd: usd, pts: pts, bins: n, range: range, now: now).map { [$0] } ?? []
         }
 
         // 多成员：带先验约束的非负最小二乘。先验取存档或历史回归的当前最佳值，无先验的不加约束。
@@ -340,7 +350,12 @@ final class PointRates {
         for (j, m) in material.enumerated() {
             let r = sol.coef[j], usd = raw[m] ?? 0, pts = r * usd, n = active[m] ?? 0
             let rel = sol.se[j].map { r > 0 ? $0 / r : .infinity }
-            guard usd >= 2, pts >= 200, n >= 4, let rel, rel <= 0.15 else { continue }
+            guard usd >= 2, pts >= 200, n >= 4, let rel, rel <= 0.15 else {
+                // 回归解已向先验收缩，证据不足时即为「实测中」的值。
+                if let p = provisional(m, observed: r, usd: usd, pts: pts, bins: n, range: range, now: now,
+                                       shrunk: true) { out.append(p) }
+                continue
+            }
             out.append(ModelRate(key: m, pointsPerUSD: r, source: .measured,
                                  note: String(format: "回归 · %@ · $%.2f · %.0f 点 · %d 箱 · ±%.0f%%",
                                               range, usd, pts, n, rel * 100),
@@ -349,10 +364,26 @@ final class PointRates {
         return out
     }
 
+    /// 证据未达实测门槛时的实时值：新比值与先验（存档或历史推算）按证据美元加权，无先验即用新比值。
+    /// 证据过少（不足 5 美分或 5 点）时比值只是噪声，不给。`shrunk` 为真表示新比值已由回归向先验收缩过。
+    private func provisional(_ key: String, observed: Double, usd: Double, pts: Double, bins: Int,
+                             range: String, now: Date, shrunk: Bool = false) -> ModelRate? {
+        guard usd >= 0.05, pts >= 5, bins >= 1, observed > 0 else { return nil }
+        let p = prior(key)
+        let rate = shrunk ? observed : p.map { ($0 * Self.priorWeightUSD + observed * usd) / (Self.priorWeightUSD + usd) } ?? observed
+        let blend = p.map { String(format: " · 与先验 %.0f 按 $%.2f:$%.2f 加权", $0, usd, Self.priorWeightUSD) } ?? ""
+        return ModelRate(key: key, pointsPerUSD: rate, source: .measuring,
+                         note: String(format: "实测中 · %@ · $%.2f · %.0f 点 · %d 箱 · 当前比值 %.0f%@",
+                                      range, usd, pts, bins, observed, shrunk ? "" : blend),
+                         measuredAt: now, evidenceUSD: usd, evidencePoints: pts, bins: bins, relErr: nil)
+    }
+
     /// 非实测的当前最佳值：存档（含换算）优先，其次历史回归，用作多成员拟合的先验与小额成员的扣除。
     private func prior(_ key: String) -> Double? {
         if let s = fromStore(key, now: Date()) { return s.pointsPerUSD }
-        return table[key]?.pointsPerUSD
+        // 上一轮的「实测中」值不作先验，否则新比值会反复与自己加权，先验失去意义。
+        guard let t = table[key], t.source != .measuring else { return nil }
+        return t.pointsPerUSD
     }
 
     // MARK: 2. 上次实测
@@ -408,43 +439,62 @@ final class PointRates {
     /// 账本的分钟桶会把边界附近的调用归进相邻的箱，稀疏的模型受害最重：09-26 对照 Mirasim 90 天导出，
     /// 分钟取整复现出软件原先的 Opus 5 ×3.54 ±45%、Fable 5.1 ×3.31 ±24%，秒级则为 ×1.95 ±7%、×4.12 ±4%。
     /// 只取经中继的行，口径同 `CostLedger.parseGatewayLine`。
-    private static func gatewayCalls(pricing: Pricing, since: Double) -> [(at: Double, key: String, usd: Double)] {
-        guard let files = try? FileManager.default.contentsOfDirectory(at: Paths.mirasimInsights,
-                                                                       includingPropertiesForKeys: nil) else { return [] }
-        var out: [(Double, String, Double)] = []
+    private static func gatewayCalls(_ file: URL, pricing: Pricing) -> [(at: Double, key: String, usd: Double)] {
+        let since = Date().timeIntervalSince1970 - CostLedger.retention
+        var out: [(at: Double, key: String, usd: Double)] = []
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
+        for line in text.split(separator: "\n") {
+            guard let root = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let ts = root["ts"] as? String, let start = fastEpochSeconds(ts),
+                  Double(start) >= since - 86400,
+                  (root["viaRelay"] as? Bool) ?? ((root["upstreamHost"] as? String)?.contains("mirasim") ?? false),
+                  let model = root["model"] as? String, !model.isEmpty else { continue }
+            let ms = (root["durationMs"] as? Int) ?? 0
+            let done = Double(start) + Double(ms) / 1000
+            guard done >= since,
+                  let usd = pricing.cost(model: model, input: (root["input"] as? Int) ?? 0,
+                                         output: (root["output"] as? Int) ?? 0,
+                                         cacheRead: (root["cacheRead"] as? Int) ?? 0,
+                                         cacheWrite: (root["cacheWrite"] as? Int) ?? 0, at: start),
+                  usd > 0 else { continue }
+            out.append((done, pricing.key(for: model), usd))
+        }
+        return out
+    }
+
+    private var gatewayCache: [String: (mtime: Date, signature: String, rows: [(at: Double, key: String, usd: Double)])] = [:]
+
+    private func gatewayCallsCached(pricing: Pricing, since: Double) -> [(at: Double, key: String, usd: Double)] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: Paths.mirasimInsights, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
+        var out: [(at: Double, key: String, usd: Double)] = []
+        var live: Set<String> = []
         for file in files where file.lastPathComponent.hasPrefix("usage-") && file.pathExtension == "ndjson" {
-            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-            for line in text.split(separator: "\n") {
-                guard let root = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                      let ts = root["ts"] as? String, let start = fastEpochSeconds(ts),
-                      Double(start) >= since - 86400,
-                      (root["viaRelay"] as? Bool) ?? ((root["upstreamHost"] as? String)?.contains("mirasim") ?? false),
-                      let model = root["model"] as? String, !model.isEmpty else { continue }
-                let ms = (root["durationMs"] as? Int) ?? 0
-                let done = Double(start) + Double(ms) / 1000
-                guard done >= since,
-                      let usd = pricing.cost(model: model, input: (root["input"] as? Int) ?? 0,
-                                             output: (root["output"] as? Int) ?? 0,
-                                             cacheRead: (root["cacheRead"] as? Int) ?? 0,
-                                             cacheWrite: (root["cacheWrite"] as? Int) ?? 0, at: start),
-                      usd > 0 else { continue }
-                out.append((done, pricing.key(for: model), usd))
+            let mtime = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            live.insert(file.path)
+            if let c = gatewayCache[file.path], c.mtime == mtime, c.signature == pricing.signature {
+                out += c.rows
+            } else {
+                let rows = Self.gatewayCalls(file, pricing: pricing)
+                gatewayCache[file.path] = (mtime, pricing.signature, rows)
+                out += rows
             }
         }
-        return out.sorted { $0.0 < $1.0 }
+        gatewayCache = gatewayCache.filter { live.contains($0.key) }
+        return out.filter { $0.at >= since }.sorted { $0.at < $1.at }
     }
 
     private func historyTable(_ label: String, calibrator: Calibrator, pricing: Pricing,
                               now: Date) -> [Int: [String: Ratio]] {
-        // 历史只随新样本缓慢变化，每小时重算一次。
-        if let h = history, h.label == label, now.timeIntervalSince(h.at) < 3600 { return h.table }
+        // 每 5 分钟重算，跟上新样本与新调用；网关文件按修改时刻缓存解析结果，未变的文件不重读。
+        if let h = history, h.label == label, now.timeIntervalSince(h.at) < 300 { return h.table }
         let series = [label: calibrator.percentSeries(label)]
         let to = now.timeIntervalSince1970 - Double(Self.settle)
         let from = now.timeIntervalSince1970 - 14 * 86400
         let list = series[label]!.filter { $0.at >= from && $0.at <= to }
         let times = list.map(\.at)
         guard times.count >= 2 else { return [:] }
-        let calls = Self.gatewayCalls(pricing: pricing, since: from)
+        let calls = gatewayCallsCached(pricing: pricing, since: from)
         let callTimes = calls.map(\.at)
         // 预算变更：重置时刻不变而百分比回落 ≥ 5 个点（同 `Calibrator.epochDrop`）。
         let isBreak = { (a: Calibrator.SeriesPoint, b: Calibrator.SeriesPoint) in
@@ -499,7 +549,8 @@ final class PointRates {
 
     /// 只存实测值。扣点率变动超过 0.5% 或距上次写盘满 10 分钟才写，读-合并-写在 flock 下进行，
     /// 常驻实例与 `--once` / `--doctor` 同时写不会互相覆盖。
-    private func persist(fresh: [String: ModelRate], now: Date) {
+    private func persist(fresh all: [String: ModelRate], now: Date) {
+        let fresh = all.filter { $0.value.source == .measured }
         guard !fresh.isEmpty else { return }
         let moved = fresh.contains { k, r in
             guard let old = savedRates[k], let v = r.pointsPerUSD else { return true }

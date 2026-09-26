@@ -183,6 +183,8 @@ struct WindowReport: Sendable {
     var headModel: String? = nil
     /// 有点数、账本却无对应支出的部分（另一台设备、未定价模型等），不归到任何模型。
     var unattributedPoints: Double? = nil
+    /// 按近期实际用法（各模型支出比例）折算的余额，只在近期混用两个以上模型时有值。
+    var mix: MixQuota? = nil
 
     /// 用量进度减时间进度：正数表示快于均速。
     var paceDelta: Double? { pacePercent.map { usedPercent - $0 } }
@@ -215,10 +217,29 @@ struct ModelQuota: Sendable {
     var tag: String? {
         switch source {
         case .estimated: return "估"
+        case .measuring: return "实测中"
         case .unknown: return "待测"
         default: return nil
         }
     }
+}
+
+/// 按近期用法折算的余额：未来的每 1 美元按近期各模型的支出比例分摊，
+/// 每美元扣点 = Σ 比例 × 该模型扣点率，余额 = 本窗口余点 ÷ 该值。
+struct MixQuota: Sendable {
+    struct Share: Sendable {
+        let key: String
+        let name: String
+        /// 该模型在近期支出里的比例，0–1。
+        let share: Double
+    }
+    /// 取样时段的说明，如「近 5 小时」。
+    let span: String
+    let shares: [Share]
+    let pointsPerUSD: Double
+    let remainingUSD: Double
+    /// 成员里有非实测的扣点率（估 / 实测中）。
+    let estimated: Bool
 }
 
 /// 当前在用的模型与判定依据。

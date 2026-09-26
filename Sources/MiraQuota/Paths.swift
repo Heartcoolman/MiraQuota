@@ -87,6 +87,8 @@ enum Diag {
     static let statusAlways = ProcessInfo.processInfo.environment["MIRAQUOTA_STATUS_ALWAYS"] == "1"
     /// 指定当前模型（模型名或价目 id），测试分模型显示用。
     static let currentModel = ProcessInfo.processInfo.environment["MIRAQUOTA_CURRENT_MODEL"].flatMap { $0.isEmpty ? nil : $0 }
+    /// 指定「按用法」的取样小时数，测试混用折算用。
+    static let mixHours = ProcessInfo.processInfo.environment["MIRAQUOTA_MIX_HOURS"].flatMap(Double.init)
     /// 覆盖速度统计的窗口长度（秒），用于验证样本不足时的退化分支。
     static let speedSpan: TimeInterval? = {
         guard let raw = ProcessInfo.processInfo.environment["MIRAQUOTA_SPEED_SPAN"],

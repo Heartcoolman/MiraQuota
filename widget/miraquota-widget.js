@@ -29,6 +29,7 @@
  * （模型标签带「估」「待测」），余量行给「余 $ · 点」，新增「换用」一行列出其余模型的余额，
  * 副行追加分模型已扣点数；页脚「满额」改列各模型扣点率。缺 `models` 时走原口径。
  * v23 模型标签移到标题下方：挤在卡头时金额列被压窄；「换用」行放不下折到第二行而不截断；页脚改为「扣点」一行。
+ * v24 新增「按用法」一行：近期混用多个模型时，按各模型支出比例折出的余额；扣点率新增「实测中」标签。
  * v15–v17 加标题栏吸附：宿主标题栏右侧本就排着自己的控件，控件贴右上角会压在上面。
  * 拖到标题栏空位附近即吸附（吸附位取「不与宿主控件重叠的最右一段空位」），
  * 之后随宿主布局变化（窗口缩放、标签增减）一起走。拖离即解除。
@@ -37,7 +38,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 23;
+  const VERSION = 24;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -335,6 +336,9 @@
   .alt { margin-top: 3px; font-size: 9.5px; color: var(--ink2); line-height: 1.45; font-variant-numeric: tabular-nums;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .alt .as { white-space: nowrap; }
+  .mix { margin-top: 2px; font-size: 9.5px; color: var(--ink2); white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+  .mix .mk, .mix .ms { color: var(--ink3); }
   .alt .ak { color: var(--ink3); margin-right: 4px; }
   .alt .as + .as::before { content: '·'; margin: 0 4px; color: var(--ink3); }
   .crow .wl { font-size: 11px; color: var(--ink2); font-weight: 550; white-space: nowrap;
@@ -915,7 +919,8 @@
       + `<div class="foot"><span class="left"></span><span class="eta"></span><span class="r"></span></div>`
       + `<div class="alt" hidden><span class="ak">换用</span>`
       + `<span class="as"><span class="an"></span> <span class="av"></span><em class="tg"></em></span>`.repeat(3)
-      + `</div><div class="sub"></div>`;
+      + `</div><div class="mix" hidden><span class="mk">按用法</span> <span class="ma"></span><em class="tg"></em>`
+      + `<span class="ms"></span></div><div class="sub"></div>`;
     c = {
       el,
       wl: el.querySelector('.wl'), amt: el.querySelector('.amt b'), full: el.querySelector('.amt i'),
@@ -926,6 +931,8 @@
       alts: [...el.querySelectorAll('.as')].map((a) => ({
         el: a, n: a.querySelector('.an'), v: a.querySelector('.av'), t: a.querySelector('.tg'),
       })),
+      mix: el.querySelector('.mix'), mixAmt: el.querySelector('.mix .ma'),
+      mixTag: el.querySelector('.mix .tg'), mixShares: el.querySelector('.mix .ms'),
       sub: el.querySelector('.sub'),
     };
     cards.set(label, c);
@@ -1011,6 +1018,20 @@
         setText(a.t, m.tag || '');
         setHidden(a.t, !m.tag);
       });
+
+      // 按用法：近期混用多个模型时，按各模型支出比例折出的余额。
+      const mix = head && w.mix && Array.isArray(w.mix.shares) ? w.mix : null;
+      setHidden(c.mix, !mix);
+      if (mix) {
+        setText(c.mixAmt, '~' + usd(mix.remainingUSD));
+        setText(c.mixTag, mix.estimated ? '估' : '');
+        setHidden(c.mixTag, !mix.estimated);
+        // 只列占比最高的两个，其余归「等」：模型一多整行被截，截掉的恰是后面的名字。
+        const top = mix.shares.slice(0, 2).map((x) => `${x.name} ${Math.round(x.share * 100)}%`).join(' · ');
+        setText(c.mixShares, ` · ${mix.span} ${top}${mix.shares.length > 2 ? ' 等' : ''}`);
+        c.mix.title = `照${mix.span}的用法，每 $1 平均扣 ${mix.rate.toFixed(1)} 点\n`
+          + mix.shares.map((x) => `${x.name} ${(x.share * 100).toFixed(1)}%`).join(' · ');
+      }
 
       const bits = [];
       if (w.scaledSpentUSD != null || headPoints || head) bits.push('账本 ' + usd(w.spentUSD));

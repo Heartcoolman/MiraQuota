@@ -313,6 +313,11 @@ final class Feed {
         if let models = w.models { out["models"] = models.map(model) }
         if let head = w.headModel { out["headModel"] = head }
         if let u = w.unattributedPoints { out["unattributedPoints"] = u }
+        if let m = w.mix {
+            out["mix"] = ["span": m.span, "rate": m.pointsPerUSD, "remainingUSD": m.remainingUSD,
+                          "estimated": m.estimated,
+                          "shares": m.shares.map { ["key": $0.key, "name": $0.name, "share": $0.share] }] as [String: Any]
+        }
         return out
     }
 

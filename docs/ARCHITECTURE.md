@@ -51,7 +51,7 @@ macOS provider 的网关账本同时覆盖 Claude 与 OpenAI Codex 请求。
 | `windows` | array | 每个额度窗口一项，见下 |
 | `speed` | object? | 速度卡数据，见下 |
 | `currentModel` | object? | 当前在用的模型 `{key, name, source, at?}`。`source`：`active`（近 15 分钟调用最多）/ `latest`（2 小时内最后一次）/ `window`（5h 内支出最多）/ `default`（花名册默认）/ `override` |
-| `rates` | array? | 各模型每美元扣点 `{key, name, rate?, source, tag?, note, usd, points, bins, measuredAt?, relErr?}`。`source`：`measured` / `lastMeasured` / `estimated`（`tag` 为「估」）/ `unknown`（无 `rate`，`tag` 为「待测」）。倍率全由本机数据求得，`note` 写明方法、时段与证据 |
+| `rates` | array? | 各模型每美元扣点 `{key, name, rate?, source, tag?, note, usd, points, bins, measuredAt?, relErr?}`。`source`：`measured` / `measuring`（证据未达门槛，实时比值与先验加权，`tag` 为「实测中」）/ `lastMeasured` / `estimated`（`tag` 为「估」）/ `unknown`（无 `rate`，`tag` 为「待测」）。倍率全由本机数据求得，`note` 写明方法、时段与证据 |
 
 `windows[]`：
 
@@ -72,6 +72,7 @@ macOS provider 的网关账本同时覆盖 Claude 与 OpenAI Codex 请求。
 | `models` | array? | 分模型额度，只在 exact 级有值。各模型共用同一点数池，美元按该模型每美元扣点折算：`{key, name, current, rate?, source, tag?, usedPoints, usedUSD, usedAsUSD?, fullUSD?, remainingPoints, remainingUSD?, cappedBy?}`。**缺省时界面退回上面的单一美元口径** |
 | `headModel` | string? | 卡头按哪个模型折算美元，是 `models[].key` 之一 |
 | `unattributedPoints` | number? | 有点数、账本却无对应支出的部分（另一台设备、未定价模型等） |
+| `mix` | object? | 按近期用法折算的余额 `{span, rate, remainingUSD, estimated, shares[{key, name, share}]}`：每美元扣点 = Σ 支出比例 × 该模型扣点率。只在近期混用两个以上模型时有值 |
 
 `speed`：`recentCount`、`sampleTotal`、`inflight`（在途起始时刻，unix 秒，非空即「生成中」）、
 `measuredTurnTTFB`（`{median, count}`），以及 `rows[]`：`model`、`samples`、`latestAt`、

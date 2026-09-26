@@ -132,6 +132,7 @@ final class QuotaEngine: ObservableObject {
         let rate = coherence?.perPoint
         let spend7d = ledger.spendByModel(from: now.addingTimeInterval(-7 * 86400), to: now, includeOpenMinute: true)
         let current = currentModel(now: now)
+        let usage = recentUsage(now: now)
 
         let windows: [WindowReport]
         switch state {
@@ -139,7 +140,7 @@ final class QuotaEngine: ObservableObject {
             let all = lastLimits?.windows ?? []
             windows = all.map { w in
                 var r = exact(w, siblings: all, rate: rate, spend7d: spend7d, snapshot: lastSnapshot, now: now)
-                attachModels(&r, w, all: all, current: current, spend7d: spend7d, now: now)
+                attachModels(&r, w, all: all, current: current, spend7d: spend7d, usage: usage, now: now)
                 return r
             }
         case .live, .stale:
@@ -378,8 +379,44 @@ final class QuotaEngine: ObservableObject {
 
     /// 本窗口的分模型额度。点数是共用真值：已用点数按格拆到模型，余点取所有约束该模型的窗口里最小的，
     /// 美元一律为「点数 ÷ 该模型每美元扣点」。只列近 7 天用过的与当前模型。
+    /// 近期用法：近 5 小时各模型支出；不足 10 美分时依次放宽到 24 小时、7 天。
+    private func recentUsage(now: Date) -> (span: String, spend: [String: Double])? {
+        let spans = Diag.mixHours.map { [($0, String(format: "近 %.0f 小时", $0))] }
+            ?? [(5.0, "近 5 小时"), (24.0, "近 24 小时"), (168.0, "近 7 天")]
+        for (hours, span) in spans {
+            let spend = ledger.spendByModel(from: now.addingTimeInterval(-hours * 3600), to: now, includeOpenMinute: true)
+            if spend.values.reduce(0, +) >= 0.1 { return (span, spend) }
+        }
+        return nil
+    }
+
+    /// 按近期用法折算的余额。取受本窗口约束、占比不低于 1% 的模型，混用两个以上才给；
+    /// 贵的模型占比再小也会明显抬高加权扣点（09-26 近 7 天：Opus 90% 加 Kimi、GPT-6、Fable 共 10%，
+    /// 加权后 119 点/$，单算 Opus 为 98.7），门槛不能按显示习惯取 5%。成员里有待测的模型时无从折算，不给。
+    private func mixQuota(_ w: LimitsSnapshot.Window, usage: (span: String, spend: [String: Double])?) -> MixQuota? {
+        guard let usage else { return nil }
+        let members = usage.spend.filter { Self.applies(w, $0.key) }
+        let total = members.values.reduce(0, +)
+        guard total > 0 else { return nil }
+        let picked = members.filter { $0.value / total >= 0.01 }.sorted { $0.value > $1.value }
+        guard picked.count >= 2 else { return nil }
+        let sum = picked.reduce(0) { $0 + $1.value }
+        var perUSD = 0.0, estimated = false
+        for (key, usd) in picked {
+            let rate = rates.rate(key)
+            guard let v = rate.pointsPerUSD else { return nil }
+            perUSD += usd / sum * v
+            if rate.source != .measured && rate.source != .lastMeasured { estimated = true }
+        }
+        guard perUSD > 0 else { return nil }
+        return MixQuota(span: usage.span,
+                        shares: picked.map { MixQuota.Share(key: $0.key, name: Pricing.displayName($0.key), share: $0.value / sum) },
+                        pointsPerUSD: perUSD, remainingUSD: max(0, w.budget - w.used) / perUSD, estimated: estimated)
+    }
+
     private func attachModels(_ r: inout WindowReport, _ w: LimitsSnapshot.Window, all: [LimitsSnapshot.Window],
-                              current: CurrentModel, spend7d: [String: Double], now: Date) {
+                              current: CurrentModel, spend7d: [String: Double],
+                              usage: (span: String, spend: [String: Double])?, now: Date) {
         guard let start = w.quotaWindow.startAt else { return }
         let inWindow = ledger.spendByModel(from: start, to: now, includeOpenMinute: true)
         let listed = Set(spend7d.filter { $0.value >= 0.01 }.keys).union(inWindow.keys).union([current.key])
@@ -436,6 +473,7 @@ final class QuotaEngine: ObservableObject {
         r.models = quotas
         r.headModel = quotas.first { $0.current }?.key ?? quotas.first?.key
         r.unattributedPoints = unattributed > 0.5 ? unattributed : nil
+        r.mix = mixQuota(w, usage: usage)
     }
 
     /// 各模型扣点率，当前模型在前，其次按近 7 天支出，没有支出的按名字。
@@ -624,6 +662,11 @@ final class QuotaEngine: ObservableObject {
                              m.remainingPoints, cap as NSString))
             }
             if let u = w.unattributedPoints { print(String(format: "       未归属 %.0f 点", u)) }
+            if let m = w.mix {
+                let parts = m.shares.map { String(format: "%@ %.0f%%", $0.name, $0.share * 100) }.joined(separator: " · ")
+                print(String(format: "       按用法（%@ %@）%.1f 点/$ · 余 $%.0f%@", m.span, parts, m.pointsPerUSD,
+                             m.remainingUSD, m.estimated ? " 估" : ""))
+            }
             if let reset = w.resetAt {
                 print("      重置 \(Self.stamp.string(from: reset))")
             } else {
