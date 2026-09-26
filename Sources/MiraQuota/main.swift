@@ -252,16 +252,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                : (w.inferred ? .secondaryLabelColor : .labelColor))
         let mark = w.inferred ? "≈" : ""
         // 小数位与面板、控件一致；金额取按点数口径折算的已用额度，与百分比同分母。
+        // 有分模型额度时金额按当前模型折算，与卡头一致。
         button.attributedTitle = styled(String(format: "%@%.1f%% · %@", mark, w.usedPercent,
-                                               Formatting.usd(w.scaledSpentUSD ?? w.spentUSD)),
+                                               Formatting.usd(w.head?.usedAsUSD ?? w.scaledSpentUSD ?? w.spentUSD)),
                                         tone: color)
 
         var tip = report.windows
             .map { w in
-                let amount = Formatting.usd(w.scaledSpentUSD ?? w.spentUSD)
+                let amount = Formatting.usd(w.head?.usedAsUSD ?? w.scaledSpentUSD ?? w.spentUSD)
                 return "\(Formatting.windowTitle(w.label)) \(String(format: "%.1f%%", w.usedPercent)) · \(amount)"
             }
             .joined(separator: "   ")
+        if let head = w.head {
+            tip += "\n当前 \(head.name)" + (head.remainingUSD.map { " · 5 小时余 ~\(Formatting.usd($0))" } ?? "")
+            let others = (w.models ?? []).filter { $0.key != head.key && $0.remainingUSD != nil }.prefix(3)
+            if !others.isEmpty {
+                tip += " · 换用 " + others.map { "\($0.name) ~\(Formatting.usd($0.remainingUSD!))" + ($0.tag ?? "") }
+                    .joined(separator: " · ")
+            }
+        }
         if let detail = report.state.detail { tip += "\n" + detail }
         button.toolTip = tip
     }

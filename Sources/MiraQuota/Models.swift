@@ -176,9 +176,58 @@ struct WindowReport: Sendable {
     /// 该窗口只计某一模型档位的用量时的档位组名（实测 `fable`），通用窗口为 nil。
     /// 这类窗口的 `spentUSD` 只含同档位模型的支出，与全机支出不同口径。
     var modelGroup: String? = nil
+    /// 本窗口按模型拆开的额度：各模型共用同一个点数池，每美元扣点不同（见 `PointRates`）。
+    /// 只在 `/v1/limits` 可读时有值；缺省时界面退回单一美元口径。
+    var models: [ModelQuota]? = nil
+    /// 卡头按哪个模型折算美元：当前在用的模型受本窗口约束时即它，否则取本窗口支出最多的成员。
+    var headModel: String? = nil
+    /// 有点数、账本却无对应支出的部分（另一台设备、未定价模型等），不归到任何模型。
+    var unattributedPoints: Double? = nil
 
     /// 用量进度减时间进度：正数表示快于均速。
     var paceDelta: Double? { pacePercent.map { usedPercent - $0 } }
+
+    var head: ModelQuota? { models?.first { $0.key == headModel } }
+}
+
+/// 一个窗口里某一模型的额度。点数是各模型共用的真值，美元按该模型每美元扣点折算。
+struct ModelQuota: Sendable {
+    let key: String
+    let name: String
+    let current: Bool
+    /// 每美元（价目）扣点，未知为 nil（「待测」）。
+    let rate: Double?
+    let source: ModelRate.Source
+    /// 本窗口里归到该模型的已扣点数。7d 各格取上游分族点数，格内按「支出 × 扣点率」拆分。
+    let usedPoints: Double
+    /// 本窗口里该模型的账本支出（价目美元）。
+    let usedUSD: Double
+    /// 把本窗口已用点数全部按该模型折成美元，与进度条同分母，卡头左侧用。
+    let usedAsUSD: Double?
+    /// 预算点按该模型折成的满额。
+    let fullUSD: Double?
+    /// 该模型还能用的点数：本窗口与所有约束它的窗口（如 Fable 之于 7d_fable）的余点取最小。
+    let remainingPoints: Double
+    let remainingUSD: Double?
+    /// 余点受哪个窗口约束，就是本窗口时为 nil。
+    let cappedBy: String?
+
+    var tag: String? {
+        switch source {
+        case .estimated: return "估"
+        case .unknown: return "待测"
+        default: return nil
+        }
+    }
+}
+
+/// 当前在用的模型与判定依据。
+struct CurrentModel: Sendable {
+    let key: String
+    let name: String
+    /// active：近 15 分钟调用最多；latest：2 小时内最后一次；window：5h 内支出最多；default：花名册默认。
+    let source: String
+    let at: Date?
 }
 
 /// 额度点余额。单位是 Mirasim 自己的计量单位，不是美元。
@@ -285,6 +334,9 @@ struct QuotaReport: Sendable {
     let unitPriceNotice: String?
     /// 账号状态提示（暂停 / 不计量 / 上游降级），正常时为 nil。
     let accountNotice: String?
+    var currentModel: CurrentModel? = nil
+    /// 各模型扣点率，当前模型在前，其余按近 7 天支出排序。
+    var rates: [ModelRate] = []
 
     static func placeholder(_ state: ChannelState) -> QuotaReport {
         QuotaReport(windows: [], capturedAt: Date(), state: state, mode: "-", host: "-",

@@ -222,7 +222,7 @@ Windows 上另有一条路线：[chiakinanam1/mirasim-quota-widget](https://gith
 |---|---|---|
 | 已用额度点、总额度、重置时刻 | `<会话 ANTHROPIC_BASE_URL>/v1/limits` | 原始值，`used` 带小数位。需要会话入口（路径前缀或令牌） |
 | 额度百分比、重置时刻（退路） | `ws://127.0.0.1:<port>/mirachannel/ws` 的 `getRelay` 帧 | 与 Mirasim 界面同源，分辨率 0.1% |
-| 等价支出 | `~/.claude/projects/*/*.jsonl` | Claude Code 全量 token，含 cache 分量与 model |
+| 等价支出 | `~/.claude/projects/*/*.jsonl` | Claude Code 的 token，含 cache 分量与 model。只计经 Mirasim 的调用（请求 id 见于网关记录，或无 id 而会话见于网关记录），不经 Mirasim 的调用不耗其额度 |
 | 等价支出（网关） | `~/.mirasim/insights/usage-*.ndjson` | 补充不写 Claude transcript 的请求，包括 OpenAI Codex 的 `openai-responses` |
 | 价目表 | `~/.mirasim/models-dev-cache.json` | 缺失时回退到内置表 |
 | 请求时长 | `~/.mirasim/insights/usage-*.ndjson` 的 `durationMs` | 单次请求总耗时，用于速度回归 |
@@ -235,8 +235,10 @@ OpenAI 的美元数是公开 API 价目下的等价金额，不代表 ChatGPT/Co
 
 `/v1/limits` 挂载在 Mirasim 为每个会话分配的回环端口上，即 Claude Code 通过 `ANTHROPIC_BASE_URL` 使用的端口。
 返回 `windows[].{name, used, budget, reset_at}` 及 `suspended` / `unmetered` / `degraded` 三个账号状态位。
-该端点未公开文档化，v0.0.220 实测可用。路由端口通过枚举持有 mirachannel 端口的那个进程的回环监听得出。
-限定同一进程，是为了在同时运行开发实例时不读到另一账号的额度。该做法来自
+该端点未公开文档化，v0.0.220 实测可用。0.0.322 之前路由端口由 server.cjs 持有，通过枚举持有 mirachannel
+端口的那个进程的回环监听得出；0.0.322 起改由 `mirasim claude` 会话进程持有，只能经会话进程环境里的
+`ANTHROPIC_BASE_URL` 找到。后一类端口用响应的 `subject` 与 relay 帧的 `login.userId` 对账后才采信。
+两种限定都是为了在同时运行开发实例时不读到另一账号的额度。该做法来自
 [chiakinanam1/mirasim-quota-widget](https://github.com/chiakinanam1/mirasim-quota-widget)。
 
 端点的鉴权方式分三个阶段。早期版本对本机连接免认证。0.0.235–0.0.272 按普通 API 请求鉴权，缺 `x-api-key` 返回 401。
@@ -431,7 +433,7 @@ Fable 到顶后剩余点只能由 Opus 使用，每点价值约翻倍，单一�
 | 取什么 | 来源 | 关联键 |
 |---|---|---|
 | 关联枢纽、模型、时刻 | `insights/usage-*.ndjson`，尾部重扫 1 MB，按 `id` 去重 | — |
-| 输出 token（即时） | Claude 取 `~/.claude/projects/*/*.jsonl` 的 `message.usage.output_tokens`；OpenAI Codex 直接取网关账本 | Claude：账本 `providerCallId` == transcript `requestId`；OpenAI：网关 `id` / `providerCallId` |
+| 输出 token（即时） | Claude 取 `~/.claude/projects/*/*.jsonl` 的 `message.usage.output_tokens`；OpenAI Codex 直接取网关账本 | Claude：账本 `providerCallId` == transcript `requestId`（2026-09-23 前）；对不上时按同会话、完成时刻与响应字节数关联；OpenAI：网关 `id` / `providerCallId` |
 | 请求时长（即时） | `diag/ev-*.ndjson` 的 `model.end.durationMs` | 账本 `id` 冒号后半段 == diag `callId` |
 
 回填后的记录中，账本 `output` 与 transcript token 逐条相等（134/159/292/987），口径一致。
@@ -501,8 +503,9 @@ python3 scripts/fake-mirasim.py garbage &   # 帧完全无法识别
 MiraQuota --port 4979 --once                # 应报「协议不符」并转入推算
 ```
 
-真实 Mirasim 同时运行不影响该验证。`/v1/limits` 的探测限定在持有锚点端口的那个进程上，
-伪实例不持有该端点，真实实例的端点也不会应答。完全解不出来时报「协议不符」并转入推算模式。
+真实 Mirasim 同时运行不影响该验证。`/v1/limits` 的探测限定在持有锚点端口的那个进程，
+外加经 `subject` 与帧内 `login.userId` 对账的会话端口；伪实例不持有该端点，真实实例的端点也不会应答。
+完全解不出来时报「协议不符」并转入推算模式。
 
 ## 命令行与故障排除
 
@@ -598,7 +601,7 @@ Mirasim 每次重启都需携带该参数，`mirasim-debug.sh` 只作用于当�
 
 | 路径 | 内容 |
 |---|---|
-| `~/.miraquota/ledger.json` | transcript 读取游标、分钟级成本桶、requestId 去重表、网关账本的按 id 账目，保留 8 天。带折算口径版本号，口径变更后启动时清空并从磁盘重建 |
+| `~/.miraquota/ledger.json` | transcript 读取游标、分钟级成本桶、requestId 去重表、网关账本的按 id 账目、跨源内容对齐表，保留 8 天。带折算口径版本号，口径变更后启动时清空并从磁盘重建 |
 | `~/.miraquota/calibration.json` | 百分比样本序列，保留 14 天，每窗口上限 4000 条 |
 | `~/.miraquota/calibration.lock` | 标定落盘的文件锁，防止常驻实例与 `--once` 并发写时互相覆盖 |
 | `~/.miraquota/anchor.json` | 最后一次实测的窗口锚点，供离线推算。未锁定的取值不覆盖已锁定边界 |

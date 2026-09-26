@@ -5,8 +5,9 @@ import Network
 ///
 /// Claude Code 开启 traces beta（`CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1`）后，
 /// 每个 API 请求结束把 `claude_code.llm_request` span POST 到这里，属性带客户端
-/// 实测的 `ttft_ms` 与 `duration_ms`，`request_id` 与网关账本的 `providerCallId`
-/// 同源可关联。据此首 token 与出字速度都成为逐请求测量值，不再依赖回归估计。
+/// 实测的 `ttft_ms` 与 `duration_ms`，`request_id` 用于样本去重（2026-09-23 前还与网关账本的
+/// `providerCallId` 同值，此后经云端中继的调用不再相通）。据此首 token 与出字速度都成为
+/// 逐请求测量值，不再依赖回归估计。
 ///
 /// 只监听 127.0.0.1、只追加写 ~/.miraquota/measured/，对任何 POST 都回 200——
 /// 导出器拿不到 2xx 会重试积压，静默吞掉比报错更合适。

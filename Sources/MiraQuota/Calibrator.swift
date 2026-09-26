@@ -336,7 +336,11 @@ final class Calibrator {
         guard let byPoints else { return byPercent }
         // 点数口径跨预算点变更可比、分辨率也更高，同等置信时优先。点数样本刚起步时
         // 置信不足，此时不该把已经收敛的百分比口径挤掉。
-        return byPoints.confidence.rank >= byPercent.confidence.rank ? byPoints : byPercent
+        // 点数口径一到 medium 即优先，不再等与百分比口径同级：百分比样本留 14 天，每点美元
+        // 在此期间跳变过就整体过时。实测 Opus 5.5 上线后每点美元由约 $0.005 升到 $0.010，
+        // 百分比口径仍以 14 天样本给出高置信的 5h 满额 $756，点数口径按近 3 天为 $1433。
+        let preferPoints = min(byPercent.confidence.rank, Calibration.Confidence.medium.rank)
+        return byPoints.confidence.rank >= preferPoints ? byPoints : byPercent
     }
 
     /// 一个采样点上的累计量，两个口径共用配对逻辑。
@@ -478,6 +482,25 @@ final class Calibrator {
         if covered >= 20 && observations >= 15 { return .high }
         if covered >= 5 && observations >= 5 { return .medium }
         return .low
+    }
+
+    /// 只读序列，供 `PointRates` 分箱。`value` 为已用点数或百分比；百分比只取当前套餐档位的样本。
+    struct SeriesPoint: Sendable {
+        let at: Double
+        let value: Double
+        let resetAt: Double
+    }
+
+    func pointSeries(_ label: String) -> [SeriesPoint] {
+        lock.lock(); defer { lock.unlock() }
+        return (state.points?[label] ?? []).map { SeriesPoint(at: $0.at, value: $0.used, resetAt: $0.resetAt) }
+    }
+
+    func percentSeries(_ label: String) -> [SeriesPoint] {
+        lock.lock(); defer { lock.unlock() }
+        let current = state.plan
+        return (state.samples[label] ?? []).filter { current == nil || $0.plan == current }
+            .map { SeriesPoint(at: $0.at, value: $0.percent, resetAt: $0.resetAt) }
     }
 
     func sampleCount(label: String) -> Int {

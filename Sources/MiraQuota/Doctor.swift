@@ -181,7 +181,8 @@ enum Doctor {
 
     private static func checkLimits(frame: RelaySnapshot?, anchorPort: Int?) {
         let client = LimitsClient()
-        guard let snapshot = client.snapshot(anchorPort: anchorPort) else {
+        let tag = frame?.accountTag ?? AccountStore().currentTag
+        guard let snapshot = client.snapshot(anchorPort: anchorPort, accountTag: tag) else {
             let routes = LimitsClient.sessionRoutes().count
             line(.warn, "额度原始值", "Mirasim 持有的回环端口上均无可读的 /v1/limits",
                  fix: routes == 0
@@ -235,8 +236,10 @@ enum Doctor {
         }
 
         let pricing = Pricing()
-        line(pricing.source.contains("内置") ? .warn : .ok, "价目表", pricing.source,
-             fix: pricing.source.contains("内置") ? "models-dev-cache.json 缺失，回退到内置表，价格可能滞后" : nil)
+        let builtinOnly = pricing.source.contains("内置")
+        line(pricing.hasRoster && !builtinOnly ? .ok : .warn, "价目表", pricing.source,
+             fix: !pricing.hasRoster ? "~/.mirasim/setting.json 无 modelRosterCache，账本可能与 Mirasim 流量监控页不同口径"
+                : (builtinOnly ? "models-dev-cache.json 缺失，回退到内置表，价格可能滞后" : nil))
 
         let ledger = CostLedger(pricing: pricing)
         ledger.refresh()
@@ -244,8 +247,9 @@ enum Doctor {
              "分钟桶 \(ledger.bucketCount) · 本轮新增 transcript \(ledger.transcriptRecords) 条 / 网关 \(ledger.ledgerRecords) 条",
              fix: ledger.bucketCount == 0 ? "保留期内无用量记录，金额会显示为 0" : nil)
         if ledger.unpricedRecords > 0 {
-            line(.warn, "未定价", "\(ledger.unpricedRecords) 条记录的模型不在价目表内",
-                 fix: "这部分支出未计入，金额偏低")
+            let names = ledger.unpricedModels.sorted { $0.value > $1.value }.map { "\($0.key) \($0.value)" }
+            line(.warn, "未定价", "\(ledger.unpricedRecords) 条记录的模型不在价目表内：" + names.joined(separator: " · "),
+                 fix: "这部分支出未计入，金额偏低；这些调用照样扣点，对应时段不参与扣点率拟合")
         }
 
         let calibrator = Calibrator()
@@ -267,9 +271,50 @@ enum Doctor {
         if let limits {
             checkScopedWindows(limits, ledger: ledger)
             checkUnitPrice(limits, ledger: ledger, calibrator: calibrator)
+            checkModelRates(limits, ledger: ledger, calibrator: calibrator, pricing: pricing)
         }
 
         checkSpeed()
+    }
+
+    /// 分族点数与各模型扣点率。分族点数是上游直接给出的（本窗口已用 − 子窗口已用），
+    /// 扣点率由 `PointRates` 按本机数据求得，逐个写明来源与证据。
+    private static func checkModelRates(_ limits: LimitsSnapshot, ledger: CostLedger, calibrator: Calibrator,
+                                        pricing: Pricing) {
+        let rates = PointRates()
+        rates.refresh(limits: limits, calibrator: calibrator, ledger: ledger, pricing: pricing)
+        guard let tree = rates.tree else {
+            line(.warn, "分族点数", "端点没有与通用窗口同重置的档位窗口，无从分族")
+            return
+        }
+        let used = { (label: String) in limits.window(label)?.used }
+        let start = limits.window(tree.root)?.quotaWindow.startAt ?? Date()
+        let spend = ledger.spendByModel(from: start, to: Date(), includeOpenMinute: true)
+        let rootUsed = used(tree.root) ?? 0
+        var parts: [String] = []
+        for cell in tree.cells {
+            guard let pts = tree.cellPoints(cell, used: used) else { continue }
+            let children = tree.nodes[cell]?.children ?? []
+            let name = children.isEmpty ? cell : "\(cell)−" + children.joined(separator: "−")
+            parts.append(String(format: "%@ %.1f", name, pts))
+            let cellSpend = spend.filter { tree.cell(of: $0.key) == cell }.values.reduce(0, +)
+            if pts > 0.05 * rootUsed, pts > 200, cellSpend == 0 {
+                line(.warn, "未归属", String(format: "%@ 有 %.0f 点而账本无对应支出", name, pts),
+                     fix: "多为另一台设备或未定价模型的消耗，这部分不归到任何模型")
+            }
+        }
+        line(.ok, "分族点数", parts.joined(separator: " · ") + "（上游直接给出，精确）")
+        let spend7d = ledger.spendByModel(from: Date().addingTimeInterval(-7 * 86400), to: Date(), includeOpenMinute: true)
+        let listed = rates.table.values.filter { $0.source != .unknown || (spend7d[$0.key] ?? 0) > 0 }
+            .sorted { (spend7d[$0.key] ?? 0) > (spend7d[$1.key] ?? 0) }
+        for r in listed {
+            let v = r.pointsPerUSD.map { String(format: "%.1f 点/$", $0) } ?? "待测"
+            let tag = r.source == .unknown ? "" : (r.tag.map { " \($0)" } ?? "")
+            line(r.pointsPerUSD == nil ? .warn : .ok, "扣点率", "\(r.name) \(v)\(tag) · \(r.note)",
+                 fix: r.pointsPerUSD == nil ? "用到该模型后按实测给出" : nil)
+        }
+        let rest = rates.table.values.filter { $0.source == .unknown && (spend7d[$0.key] ?? 0) == 0 }.map(\.name).sorted()
+        if !rest.isEmpty { line(.ok, "扣点率", "待测（无数据）：" + rest.joined(separator: "、")) }
     }
 
     /// 模型档位窗口的支出口径。这类窗口只累计特定档位的模型用量，配上全机支出会
@@ -500,6 +545,12 @@ enum Doctor {
         line(s.live > 0 ? .ok : .warn, "注入状态",
              "\(s.live)/\(s.targets) 个页面已带控件",
              fix: s.live == 0 ? "菜单栏实例每 10 秒巡检一次，稍等或看 ~/.miraquota/agent.log" : nil)
+        if let script = s.script, !s.pages.isEmpty {
+            let stale = s.pages.contains { $0 != script }
+            line(stale ? .warn : .ok, "控件版本",
+                 "页面 v\(s.pages.map(String.init).joined(separator: "/")) · 脚本 v\(script)",
+                 fix: stale ? "版本不一致时注入器会在下一轮巡检重注入；持续不一致说明巡检未运行" : nil)
+        }
     }
 
     private static func fetch(_ url: String) -> Data? {

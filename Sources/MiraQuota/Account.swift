@@ -95,6 +95,13 @@ final class AccountStore {
         return state?.since ?? 0
     }
 
+    /// 当前账号标识（带来源前缀）。从未观测到时为 nil。
+    /// 取自落盘状态，比单帧的 login 字段稳定：部分帧不带 login 时不会抖动。
+    var currentTag: String? {
+        lock.lock(); defer { lock.unlock() }
+        return state?.tag
+    }
+
     /// 当前套餐档位。从未观测到时为 nil。
     var currentPlan: String? {
         lock.lock(); defer { lock.unlock() }

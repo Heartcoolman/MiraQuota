@@ -140,11 +140,13 @@ final class Injector {
         if present, absentRounds >= 3 { present = false; onPresence?(false) }
     }
 
-    /// 供 `--doctor` 独立查一次：调试端口、页面数、已带控件的页面数。
-    static func status() -> (port: UInt16?, targets: Int, live: Int) {
-        guard let port = debugPort() else { return (nil, 0, 0) }
+    /// 供 `--doctor` 独立查一次：调试端口、页面数、已带控件的页面数、页面里的控件版本与脚本版本。
+    static func status() -> (port: UInt16?, targets: Int, live: Int, pages: [Int], script: Int?) {
+        let script = loadWidget().flatMap(version)
+        guard let port = debugPort() else { return (nil, 0, 0, [], script) }
         let list = targets(port: port)
-        return (port, list.count, list.filter { widgetVersion($0) > 0 }.count)
+        let pages = list.map(widgetVersion)
+        return (port, list.count, pages.filter { $0 > 0 }.count, pages.filter { $0 > 0 }, script)
     }
 
     /// 调试端口：环境变量覆盖 → 默认 9333 → Chromium 惯用的 9222。
@@ -197,9 +199,11 @@ final class Injector {
         ])
     }
 
-    /// 从脚本里读版本号声明。
-    private static func version(_ source: String) -> Int? {
-        guard let r = source.range(of: "__miraquotaVersion\\s*=\\s*[0-9]+", options: .regularExpression),
+    /// 从脚本里读版本号声明。控件写的是 `const VERSION = N`、`window.__miraquotaVersion = VERSION`，
+    /// 只认后者读到的恒为 0，页面版本永远对不上，每轮巡检都重注入一次（弹层随之收起）。
+    static func version(_ source: String) -> Int? {
+        guard let r = source.range(of: "(?:const\\s+VERSION|__miraquotaVersion)\\s*=\\s*[0-9]+",
+                                   options: .regularExpression),
               let n = source[r].split(separator: "=").last.flatMap({ Int($0.trimmingCharacters(in: .whitespaces)) })
         else { return nil }
         return n

@@ -102,12 +102,100 @@ private struct OverviewPane: View {
                     }
                 }
 
+                if !engine.report.rates.isEmpty {
+                    ModelTable(report: engine.report)
+                }
+
                 MetaGrid(report: engine.report, pricing: engine.pricingSource)
             }
             .padding(18)
             .frame(maxWidth: 620, alignment: .leading)
         }
     }
+}
+
+/// 全模型扣点表与「换模型怎么算」。各模型共用同一点数池，每美元扣点不同，
+/// 余额一律为「剩余点数 ÷ 该模型扣点率」；扣点率的来源逐行写明。
+private struct ModelTable: View {
+    let report: QuotaReport
+
+    private var five: WindowReport? { report.windows.first { $0.label == "5h" } }
+    private var seven: WindowReport? { report.windows.first { $0.label == "7d" } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("各模型额度").font(.system(size: 11.5, weight: .medium)).foregroundStyle(.secondary)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
+                GridRow {
+                    ForEach(["模型", "每 $1 扣点", "来源", "5 小时余", "7 天余", "本周已扣"], id: \.self) {
+                        Text($0).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                    }
+                }
+                ForEach(report.rates, id: \.key) { r in
+                    let current = r.key == report.currentModel?.key
+                    GridRow {
+                        Text((current ? "▶ " : "") + r.name)
+                            .font(.system(size: 11, weight: current ? .semibold : .regular))
+                        Text(r.pointsPerUSD.map { String(format: "%.1f", $0) } ?? "待测")
+                            .font(.system(size: 11).monospacedDigit())
+                        Text(source(r)).font(.system(size: 10.5)).foregroundStyle(.secondary)
+                            .help(r.note)
+                        Text(left(five, r)).font(.system(size: 11).monospacedDigit())
+                        Text(left(seven, r)).font(.system(size: 11).monospacedDigit())
+                        Text(used(seven, r)).font(.system(size: 11).monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if let explain { Text(explain).font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true) }
+        }
+        .padding(.top, 2)
+    }
+
+    private func source(_ r: ModelRate) -> String {
+        let day = r.measuredAt.map { MainWindowFormat.day.string(from: $0) } ?? ""
+        switch r.source {
+        case .measured: return "实测"
+        case .lastMeasured: return "上次实测 \(day)"
+        case .estimated: return "估" + (r.relErr.map { String(format: " ±%.0f%%", $0 * 100) } ?? "")
+        case .unknown: return "待测"
+        }
+    }
+
+    /// 窗口余点按该模型折美元；窗口的分模型行里有它就用，没有就按窗口余点直接折。
+    private func left(_ w: WindowReport?, _ r: ModelRate) -> String {
+        guard let w, let p = w.points, let rate = r.pointsPerUSD else { return "—" }
+        let points = w.models?.first { $0.key == r.key }?.remainingPoints ?? max(0, p.budget - p.used)
+        return "~" + Formatting.usd(points / rate)
+    }
+
+    private func used(_ w: WindowReport?, _ r: ModelRate) -> String {
+        guard let m = w?.models?.first(where: { $0.key == r.key }), m.usedPoints >= 1 else { return "—" }
+        return "\(Formatting.kilo(m.usedPoints)) 点"
+    }
+
+    /// 用当前数字把「换模型」讲一遍：点数是共用的，只有每美元扣多少点不同。
+    private var explain: String? {
+        guard let w = five, let p = w.points, let cur = report.rates.first(where: { $0.key == report.currentModel?.key }),
+              let cr = cur.pointsPerUSD else { return nil }
+        let left = max(0, p.budget - p.used)
+        var text = "5 小时窗口共享余 \(Formatting.kilo(left)) 点，所有模型都从这里扣。"
+            + String(format: "%@ 每 $1 扣 %.0f 点，余点约合 %@", cur.name, cr, Formatting.usd(left / cr))
+        if let other = report.rates.first(where: { $0.key != cur.key && $0.pointsPerUSD != nil }),
+           let orate = other.pointsPerUSD {
+            text += String(format: "；换用 %@（每 $1 扣 %.0f 点%@）约合 %@", other.name, orate,
+                           other.tag.map { "，\($0)" } ?? "", Formatting.usd(left / orate))
+        }
+        return text + "。已扣掉的点不会因为换模型而退回，换用后按新模型的扣点率继续扣。"
+    }
+}
+
+private enum MainWindowFormat {
+    static let day: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd"
+        return f
+    }()
 }
 
 /// 顶部状态条：通道档位、采集时刻、在途请求。弹层把这三样挤在一行里，
@@ -155,7 +243,9 @@ private struct MetaGrid: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("口径").font(.system(size: 11.5, weight: .medium)).foregroundStyle(.secondary)
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
-                if let unit = report.unitPriceUSD {
+                if let rates = Formatting.rateLine(report.rates) {
+                    row("扣点", rates)
+                } else if let unit = report.unitPriceUSD {
                     row("满额", "回归标定优先 · 兜底 额度点 × $" + String(format: "%.6f", unit))
                 } else if let notice = report.unitPriceNotice {
                     row("满额", notice)
@@ -248,7 +338,7 @@ private struct SessionTable: View {
 
     private func detail(_ r: SessionSpeedRow) -> String {
         let head = r.ttft.map { String(format: "首 %.1fs · ", $0) } ?? ""
-        return head + (r.rate.map { String(format: "%.0f tok/s", $0) } ?? "—")
+        return head + (r.rate.map { String(format: "出字 %.0f tok/s", $0) } ?? "—")
     }
 }
 
@@ -270,9 +360,9 @@ private struct Provenance: View {
 
     private var notes: [String] {
         var out = [
-            "实测行（首 token 不带 ≈）：Claude Code 的 OTel trace 逐请求上报首 token 与时长；OpenAI Codex 使用网关回归",
-            "回归行（首 token 带 ≈）：网关账本只有总时长，首 token 取 48 小时样本的回归截距",
-            "出字速度取最近 \(speed.recentCount) 次请求按 token 加权，测的是客户端观测到的投递速率",
+            "出字速度取最近 \(speed.recentCount) 次请求按 token 加权，扣除首 token 等待",
+            "端到端速度是输出量 ÷ 请求总时长，包含排队和首 token 等待",
+            "GPT/Codex 没有逐请求首 token 数据，因此只显示端到端速度；Claude OTel 行才显示出字速度",
             "近期通过筛选的请求 \(speed.sampleTotal) 次",
         ]
         if let m = speed.measuredTurnTTFB {

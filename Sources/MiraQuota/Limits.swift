@@ -28,6 +28,10 @@ struct LimitsSnapshot: Sendable {
     /// 是否付费账号。内测账号为 false，额度按官方口径减半（见 `PlanRate`）；
     /// 旧版端点不带该字段时为 nil，美元折算退回账本标定。
     let paid: Bool?
+    /// 账号标识，与 relay 帧的 `login.userId` 同值。0.0.322 起路由端口挂在
+    /// `mirasim claude` 会话进程上，与 mirachannel 不再同进程，「同一进程即同一账号」
+    /// 的结构保证盖不到它，改用该字段与帧的 userId 对账。
+    let subject: String?
 
     func window(_ label: String) -> Window? {
         windows.first { $0.label.caseInsensitiveCompare(label) == .orderedSame }
@@ -62,6 +66,10 @@ final class LimitsClient {
     private static let minInterval: TimeInterval = 15
     /// 端口枚举全军覆没后的静默期。旧版 Mirasim 没有这个端点，不必每 15 秒重扫一遍。
     private static let rediscoverAfter: TimeInterval = 300
+    /// 失败尚不构成「这版没有该端点」证据时的重试间隔：会话入口还没出现，
+    /// 或刚出现一轮尚未就绪。登录时 Mirasim 与会话都晚于本进程启动，
+    /// 这段时间按长静默处理会让面板平白降级五分钟。
+    private static let retryAfter: TimeInterval = 45
     /// mirachannel 首页端口。server.cjs 一起来就绑定，且只回 HTML，
     /// 不能拿它的失败当作「这版 Mirasim 没有该端点」的证据。
     private static let homePort = 4970
@@ -70,18 +78,27 @@ final class LimitsClient {
     private var cachedPort: Int?
     /// 该端口配对的会话入口（路径前缀与令牌）。两者随会话存亡，故与端口一同缓存、一同失效。
     private var cachedRoute: SessionRoute?
+    /// 缓存端口是否在锚点进程的监听列表之外（会话进程持有的路由端口）。
+    /// 这类端口每次取值都要用响应的 `subject` 与帧的 userId 对账。
+    private var cachedForeign = false
     private var last: LimitsSnapshot?
     private var lastAttempt = Date.distantPast
-    private var discoveryFailedAt = Date.distantPast
+    private var quietUntil = Date.distantPast
+    /// 连续几轮「候选端口配到了会话入口、请求仍不通」。第一轮可能是会话端口刚绑定、
+    /// 路由还没挂上，故第二轮起才转入长静默。
+    private var routedFailures = 0
     /// 端点在本机确认可用过。静默期只该拦「这版 Mirasim 没有该端点」；
     /// 端点挂在会话端口上，会话退出端口即消失，新会话的端口晚几秒才起来，
     /// 确认过存在之后的失败都是这类瞬态，进静默期会让面板平白降级五分钟。
     private var endpointConfirmed = false
 
-    /// 取当前额度。`anchorPort` 是已连上的 mirachannel 端口，探测只在同一进程持有的
-    /// 端口上进行，避免读到另一个 Mirasim 实例（可能是另一个账号）的额度。
+    /// 取当前额度。`anchorPort` 是已连上的 mirachannel 端口，对该进程持有的端口
+    /// 探测是「同进程即同账号」的结构保证；会话进程持有的路由端口（0.0.322 起）
+    /// 不在其列，改用响应的 `subject` 与 `accountTag` 对账，两者都为了
+    /// 不在并行实例上读到另一账号的额度。`accountTag` 取落盘的账号判据
+    /// （`AccountStore.currentTag`），比单帧的 login 字段稳定。
     /// 未到间隔时返回上一次的结果，取不到返回 nil。
-    func snapshot(now: Date = Date(), anchorPort: Int? = nil) -> LimitsSnapshot? {
+    func snapshot(now: Date = Date(), anchorPort: Int? = nil, accountTag: String? = nil) -> LimitsSnapshot? {
         lock.lock()
         if now.timeIntervalSince(lastAttempt) < Self.minInterval, let last {
             lock.unlock()
@@ -90,32 +107,48 @@ final class LimitsClient {
         lastAttempt = now
         let port = cachedPort
         let route = cachedRoute
-        let quietUntil = discoveryFailedAt.addingTimeInterval(Self.rediscoverAfter)
+        let foreign = cachedForeign
+        let quiet = quietUntil
         lock.unlock()
 
         if Diag.forceOffline || Diag.noLimits { return nil }
+        let subject = Self.expectedSubject(accountTag)
 
-        var found = port.flatMap { Self.fetch(port: $0, route: route) }
-        if found == nil, now.timeIntervalSince(quietUntil) >= 0 {
+        var found = port.flatMap { Self.fetch(port: $0, route: route, foreign: foreign, subject: subject) }
+        if found == nil, now >= quiet {
             let candidates = Self.routerPorts(anchor: anchorPort)
-            let routes = candidates.isEmpty ? [:] : Self.sessionRoutes()
-            for candidate in candidates where candidate != port {
-                if let s = Self.fetch(port: candidate, route: routes[candidate]) {
+            let routes = Self.sessionRoutes()
+            // 0.0.322 起路由端口随 `mirasim claude` 会话进程存亡，不再出现在 server.cjs
+            // 的监听列表里；会话进程环境里的 ANTHROPIC_BASE_URL 是找到它们的唯一途径。
+            let foreignPorts = routes.keys.filter { !candidates.contains($0) }.sorted()
+            for candidate in candidates + foreignPorts where candidate != port {
+                if let s = Self.fetch(port: candidate, route: routes[candidate],
+                                      foreign: !candidates.contains(candidate), subject: subject) {
                     found = s
                     lock.lock()
                     cachedPort = candidate
                     cachedRoute = routes[candidate]
+                    cachedForeign = !candidates.contains(candidate)
                     lock.unlock()
                     break
                 }
             }
-            // 只有「会话端口在、却没有这个端点、且从未成功过」才进静默期——
+            // 只有「会话入口在、却没有这个端点、且从未成功过」才进长静默——
             // 那是旧版 Mirasim 的表现。候选只剩首页端口说明会话尚未注册：
             // Mirasim 重启后首页端口立刻就绪，会话端口要晚几十秒；
             // 确认过端点的实例失败属会话端口更替，两者按常规间隔重试即可。
+            // 没有会话入口时的失败同样不是证据：新版按前缀放行，裸路径必然 401。
             if found == nil, !endpointConfirmed,
-               candidates.contains(where: { $0 != Self.homePort }) {
-                lock.lock(); discoveryFailedAt = now; lock.unlock()
+               (candidates + foreignPorts).contains(where: { $0 != Self.homePort }) {
+                let routed = (candidates + foreignPorts).contains { routes[$0] != nil }
+                lock.lock()
+                routedFailures = routed ? routedFailures + 1 : 0
+                let streak = routedFailures
+                let span = streak >= 2 ? Self.rediscoverAfter : Self.retryAfter
+                quietUntil = now.addingTimeInterval(span)
+                lock.unlock()
+                Diag.log("limits \(candidates.count + foreignPorts.count) 个端口全败 · 会话入口 "
+                    + (routed ? "有（连续 \(streak) 轮）" : "无") + " · 静默 \(Int(span))s")
             }
         }
 
@@ -123,8 +156,11 @@ final class LimitsClient {
         if found == nil {
             cachedPort = nil
             cachedRoute = nil
+            cachedForeign = false
         } else {
             endpointConfirmed = true
+            routedFailures = 0
+            quietUntil = .distantPast
         }
         last = found
         lock.unlock()
@@ -137,8 +173,10 @@ final class LimitsClient {
         lock.lock()
         cachedPort = nil
         cachedRoute = nil
+        cachedForeign = false
         last = nil
-        discoveryFailedAt = .distantPast
+        quietUntil = .distantPast
+        routedFailures = 0
         lastAttempt = .distantPast
         lock.unlock()
     }
@@ -150,6 +188,26 @@ final class LimitsClient {
     }
 
     // MARK: 取值
+
+    /// 账号判据 → `/v1/limits` 响应里 `subject` 的期望值。只有 userId 判据可与之对账；
+    /// 旧盘面落盘的令牌尾号（`t:` 或无前缀）与 subject 不可互比，按判不出处理。
+    private static func expectedSubject(_ tag: String?) -> String? {
+        guard let tag, AccountTag.source(tag) == "u" else { return nil }
+        return String(tag.dropFirst(2))
+    }
+
+    /// 取数并按需对账账号。`foreign` 为真表示端口不在锚点进程的监听列表里
+    /// （`mirasim claude` 会话进程持有的路由端口），结构保证盖不到它，
+    /// 必须用响应的 `subject` 与帧的 userId 对上才采信；判不出账号时宁可不用——
+    /// 并行跑着的另一个实例可能登着别的账号。
+    private static func fetch(port: Int, route: SessionRoute?, foreign: Bool,
+                              subject: String?) -> LimitsSnapshot? {
+        guard let s = fetch(port: port, route: route) else { return nil }
+        if foreign {
+            guard let subject, s.subject == subject else { return nil }
+        }
+        return s
+    }
 
     private static func fetch(port: Int, route: SessionRoute?) -> LimitsSnapshot? {
         // 没有会话入口的端口（预热槽）只能试裸路径；0.0.220 那版对本机免认证。
@@ -193,7 +251,8 @@ final class LimitsClient {
                               suspended: root["suspended"] as? Bool ?? false,
                               unmetered: root["unmetered"] as? Bool ?? false,
                               degraded: root["degraded"] as? Bool ?? false,
-                              paid: root["paid"] as? Bool)
+                              paid: root["paid"] as? Bool,
+                              subject: root["subject"] as? String)
     }
 
     private static func number(_ v: Any?) -> Double? {
@@ -205,8 +264,10 @@ final class LimitsClient {
 
     // MARK: 端口发现
 
-    /// Mirasim 进程持有的回环监听端口。会话进出会增减端口，故每次失败后重新枚举。
+    /// server.cjs 进程持有的回环监听端口。会话进出会增减端口，故每次失败后重新枚举。
     /// 给了 `anchor` 就只取持有该端口的那个进程，避免读到并行开发实例的额度。
+    /// 0.0.322 起会话的路由端口改由 `mirasim claude` 进程持有，不在本函数的结果里，
+    /// 由 `sessionRoutes()` 的键补上。
     ///
     /// `lsof` 必须用 `-p` 限定进程：`lsof -iTCP:<port>` 不带 `-p` 会全系统扫描，
     /// 实测会把调用线程卡住上百秒。故先用 `ps` 拿到候选进程，再一次 `lsof` 取端口。

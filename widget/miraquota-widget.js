@@ -25,6 +25,10 @@
  * v21 满额可取官方口径（macOS provider 自 2026-09-03 起不再下发 planRateUSD，满额回归账本标定；分支保留给其它 provider）：provider 给出 planRateUSD（套餐公布的每点美元，内测减半）时，
  * 满额与主行都由它折算，账本反推的单价退到页脚作对照。
  *
+ * v22 分模型额度：各模型共用同一点数池、每美元扣点不同。provider 下发 `models` 时卡头按当前模型折美元
+ * （模型标签带「估」「待测」），余量行给「余 $ · 点」，新增「换用」一行列出其余模型的余额，
+ * 副行追加分模型已扣点数；页脚「满额」改列各模型扣点率。缺 `models` 时走原口径。
+ * v23 模型标签移到标题下方：挤在卡头时金额列被压窄；「换用」行放不下折到第二行而不截断；页脚改为「扣点」一行。
  * v15–v17 加标题栏吸附：宿主标题栏右侧本就排着自己的控件，控件贴右上角会压在上面。
  * 拖到标题栏空位附近即吸附（吸附位取「不与宿主控件重叠的最右一段空位」），
  * 之后随宿主布局变化（窗口缩放、标签增减）一起走。拖离即解除。
@@ -33,7 +37,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 20;
+  const VERSION = 23;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -156,13 +160,21 @@
   };
 
   const winTitle = (label) => label === '5h' ? '5 小时' : label === '7d' ? '7 天'
-    : label === '7d_fable' ? '7 天 · Fable' : label;
+    : label === '7d_fable' ? '7 天 · Fable' : label === '7d_claude' ? '7 天 · Claude' : label;
 
   // 胶囊上的窗口简称，长度要压住。
-  const winShort = (label) => label === '7d_fable' ? '7d·F' : label;
+  const winShort = (label) => label === '7d_fable' ? '7d·F' : label === '7d_claude' ? '7d·C' : label;
 
-  // 模型显示名去掉快照日期后缀，避免长名折行撑高速度卡。
-  const shortModel = (m) => String(m || '').replace(/-\d{8}$/, '');
+  // 模型显示名去掉快照日期并压缩 GPT 变体，避免长名折行撑高速度卡。
+  const shortModel = (m) => {
+    let name = String(m || '').split('/').pop().replace(/-\d{8}$/, '');
+    const parts = name.split('-');
+    if (parts[0].toLowerCase() === 'gpt' && parts.length > 1) {
+      return ['GPT', ...parts.slice(1).map((part) => part ? part[0].toUpperCase() + part.slice(1) : part)]
+        .join(' ');
+    }
+    return name;
+  };
 
   // 打满外推的时长短格式。
   function fmtDur(sec) {
@@ -170,6 +182,9 @@
     if (sec < 86400) return (sec / 3600).toFixed(1) + ' 小时';
     return (sec / 86400).toFixed(1) + ' 天';
   }
+
+  // 在途时长。过 90 秒后纯秒数要心算，改成分秒。
+  const elapsed = (s) => s < 90 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
 
   // 样本新鲜度。速度不动多半是没有新请求，把这件事显式说出来。
   function ago(t) {
@@ -266,8 +281,11 @@
   /* 胶囊上的金额取次级色而非三级：它是收起状态下唯一的绝对量，压得太暗就读不出。 */
   .u { color: var(--ink2); }
 
+  /* 宽度由速度卡最宽的一行定：模型名 78 + 指标 126（三位数速率）+ 偏离标 45（三位数百分比）
+     + 时刻 43 + 三道 6px 间距，合计约 310px；再加面板内边距 24、卡片内边距与描边 21、滚动条 6。
+     窄于此值时指标列会被压成省略号，偏离标会贴上文字。 */
   .pop {
-    position: fixed; width: 306px; border-radius: 16px; padding: 12px; z-index: 2147483646;
+    position: fixed; width: 366px; border-radius: 16px; padding: 12px; z-index: 2147483646;
     max-height: calc(100vh - 16px); overflow-y: auto; overscroll-behavior: contain;
     background: var(--pop); border: .5px solid var(--bd); box-shadow: var(--shadow);
     color: var(--ink); font-size: 12px; backdrop-filter: blur(56px) saturate(180%);
@@ -306,6 +324,19 @@
   #speedbox { display: block; margin-top: 3px; }
   /* 标签定宽：三个窗口名长度不同，不定宽金额会各自起在不同位置。 */
   .crow { display: grid; grid-template-columns: 74px 1fr auto; align-items: baseline; gap: 5px; }
+  /* 模型标签在标题下方，同处 74px 标题列：挤进卡头会把金额列压窄。 */
+  .crow .wlc { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; min-width: 0; }
+  .crow .mdl { font-size: 9px; font-weight: 600; color: var(--ink2); background: var(--bg);
+    border-radius: 6px; padding: 1px 5px; max-width: 74px; box-sizing: border-box; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .crow .mdl.cur { color: var(--accent); background: var(--accentbg); }
+  .tg { font-style: normal; font-size: 8.5px; font-weight: 600; margin-left: 3px; color: var(--warn); }
+  /* 放不下折到第二行、最多两行：被截掉的正是要比较的余额。 */
+  .alt { margin-top: 3px; font-size: 9.5px; color: var(--ink2); line-height: 1.45; font-variant-numeric: tabular-nums;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .alt .as { white-space: nowrap; }
+  .alt .ak { color: var(--ink3); margin-right: 4px; }
+  .alt .as + .as::before { content: '·'; margin: 0 4px; color: var(--ink3); }
   .crow .wl { font-size: 11px; color: var(--ink2); font-weight: 550; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
   .crow .amt { font-size: 13.5px; font-weight: 700; letter-spacing: -.01em;
@@ -347,7 +378,7 @@
   /* 模型名与数值列定宽：宽度随内容浮动时，偏离标与时刻会逐行错开。
      数值列可压到下限后省略，不折行——折行会撑高行高并推歪右侧两列。 */
   .sp { display: flex; align-items: center; gap: 6px; font-size: 10px; margin-top: 5px; }
-  .sp .m { width: 58px; flex: none; color: var(--ink); font-weight: 600;
+  .sp .m { width: 78px; flex: none; color: var(--ink); font-weight: 600;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sp .v { min-width: 100px; font-variant-numeric: tabular-nums; color: var(--ink2);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -393,7 +424,7 @@
       <div id="speedbox"></div>
       <div class="hair"></div>
       <div class="meta">
-        <div class="mrow" id="rowFull"><span class="k">满额</span><span class="mv" id="metaFull"></span></div>
+        <div class="mrow" id="rowFull"><span class="k" id="keyFull">满额</span><span class="mv" id="metaFull"></span></div>
         <div class="mrow" id="rowLedger"><span class="k">账本</span><span class="mv" id="metaLedger"></span></div>
         <div class="mrow" id="rowLine"><span class="k">线路</span><span class="mv" id="metaLine"></span></div>
       </div>
@@ -409,7 +440,7 @@
     sep: $('sep'), seg2: $('seg2'), lb2: $('lb2'), v2: $('v2'),
     chip: $('chip'), cdot: $('cdot'), clabel: $('clabel'),
     banners: $('banners'), cards: $('cards'), speedbox: $('speedbox'),
-    rowFull: $('rowFull'), metaFull: $('metaFull'),
+    rowFull: $('rowFull'), metaFull: $('metaFull'), keyFull: $('keyFull'),
     rowLedger: $('rowLedger'), metaLedger: $('metaLedger'),
     rowLine: $('rowLine'), metaLine: $('metaLine'),
     stamp: $('stamp'), quit: $('quit'),
@@ -833,9 +864,12 @@
     setText(els.lb1, winShort(primary.label));
     setText(els.v1, (primary.inferred ? '≈' : '') + pct(primary.usedPercent));
     setTone(els.v1, 'v', toneOf(primary.usedPercent));
-    setText(els.u1, primary.scaledSpentUSD == null && primary.fullUSD == null && primary.points
-      ? kilo(primary.points.used) + ' 点'
-      : usd(primary.scaledSpentUSD != null ? primary.scaledSpentUSD : primary.spentUSD));
+    const head = Array.isArray(primary.models)
+      ? primary.models.find((m) => m.key === primary.headModel) : null;
+    setText(els.u1, head && head.usedAsUSD != null ? usd(head.usedAsUSD)
+      : primary.scaledSpentUSD == null && primary.fullUSD == null && primary.points
+        ? kilo(primary.points.used) + ' 点'
+        : usd(primary.scaledSpentUSD != null ? primary.scaledSpentUSD : primary.spentUSD));
 
     setHidden(els.sep, !second);
     setHidden(els.seg2, !second);
@@ -847,7 +881,8 @@
 
     pill.title = d.windows
       .map((w) => `${winTitle(w.label)} ${pct(w.usedPercent)}`)
-      .join('　') + (d.stateLabel ? `\n${d.stateLabel}` : '');
+      .join('　') + (head ? `\n当前 ${head.name}${head.remainingUSD != null ? ' · 5 小时余 ~' + usd(head.remainingUSD) : ''}` : '')
+      + (d.stateLabel ? `\n${d.stateLabel}` : '');
   }
 
   // 横幅数量随状态变化，按需增删，文本走 textContent 不拼 HTML。
@@ -874,16 +909,23 @@
     if (c) return c;
     const el = document.createElement('div');
     el.className = 'card';
-    el.innerHTML = `<div class="crow"><span class="wl"></span>`
+    el.innerHTML = `<div class="crow"><span class="wlc"><span class="wl"></span><span class="mdl" hidden><span class="mn"></span><em class="tg"></em></span></span>`
       + `<span class="amt"><b></b> <i></i></span><span class="pc"></span></div>`
       + `<div class="bar"><div class="fill"></div><div class="pace" hidden></div></div>`
       + `<div class="foot"><span class="left"></span><span class="eta"></span><span class="r"></span></div>`
-      + `<div class="sub"></div>`;
+      + `<div class="alt" hidden><span class="ak">换用</span>`
+      + `<span class="as"><span class="an"></span> <span class="av"></span><em class="tg"></em></span>`.repeat(3)
+      + `</div><div class="sub"></div>`;
     c = {
       el,
       wl: el.querySelector('.wl'), amt: el.querySelector('.amt b'), full: el.querySelector('.amt i'),
+      mdl: el.querySelector('.mdl'), mn: el.querySelector('.mn'), mtg: el.querySelector('.mdl .tg'),
       pc: el.querySelector('.pc'), fill: el.querySelector('.fill'), pace: el.querySelector('.pace'),
       left: el.querySelector('.left'), eta: el.querySelector('.eta'), right: el.querySelector('.r'),
+      alt: el.querySelector('.alt'),
+      alts: [...el.querySelectorAll('.as')].map((a) => ({
+        el: a, n: a.querySelector('.an'), v: a.querySelector('.av'), t: a.querySelector('.tg'),
+      })),
       sub: el.querySelector('.sub'),
     };
     cards.set(label, c);
@@ -903,13 +945,27 @@
       // 三张卡的序号都取不到，错峰就退化成同时出现。
       setVar(c.el, '--i', String(i));
       setText(c.wl, winTitle(w.label));
+      const models = Array.isArray(w.models) && w.models.length ? w.models : null;
+      const head = models ? (models.find((m) => m.key === w.headModel) || models[0]) : null;
+      setHidden(c.mdl, !head);
       // 主行按点数口径折算，与百分比、进度条同分母；账本支出落到副行。
       // 满额不可用而点数在手时主行改用点数：此时账本已判定不自洽，不该被抬到主行。
-      const headPoints = w.scaledSpentUSD == null && w.fullUSD == null && w.points;
-      setText(c.amt, headPoints ? kilo(w.points.used) + ' 点'
-        : usd(w.scaledSpentUSD != null ? w.scaledSpentUSD : w.spentUSD));
-      setText(c.full, '/ ' + (w.fullUSD == null ? '标定中'
-        : (w.confidence === 'high' ? '' : '~') + usd(w.fullUSD)));
+      const headPoints = head ? head.rate == null && w.points
+        : w.scaledSpentUSD == null && w.fullUSD == null && w.points;
+      if (head) {
+        // 分模型：美元按卡头模型的每美元扣点折算，点数是各模型共用的真值。
+        setText(c.mn, head.name);
+        setText(c.mtg, head.tag || '');
+        setHidden(c.mtg, !head.tag);
+        setTone(c.mdl, 'mdl', head.current ? 'cur' : '');
+        setText(c.amt, headPoints ? kilo(w.points.used) + ' 点' : usd(head.usedAsUSD));
+        setText(c.full, headPoints ? `/ ${kilo(w.points.budget)} 点` : '/ ~' + usd(head.fullUSD));
+      } else {
+        setText(c.amt, headPoints ? kilo(w.points.used) + ' 点'
+          : usd(w.scaledSpentUSD != null ? w.scaledSpentUSD : w.spentUSD));
+        setText(c.full, '/ ' + (w.fullUSD == null ? '标定中'
+          : (w.confidence === 'high' ? '' : '~') + usd(w.fullUSD)));
+      }
       setText(c.pc, (w.inferred ? '≈' : '') + pct(w.usedPercent));
       setTone(c.pc, 'pc', tone);
       setStyle(c.fill, 'width', Math.min(100, Math.max(0, w.usedPercent)) + '%');
@@ -918,8 +974,14 @@
       setHidden(c.pace, !showPace);
       if (showPace) setStyle(c.pace, 'left', w.pacePercent + '%');
 
-      if (w.remainingUSD != null) {
-        setText(c.left, `余 ${w.confidence === 'high' ? '' : '~'}${usd(w.remainingUSD)}`);
+      if (head || w.remainingUSD != null) {
+        if (head) {
+          const cap = head.cappedBy ? ` · 受${winShort(head.cappedBy)}限` : '';
+          setText(c.left, (head.remainingUSD != null ? `余 ~${usd(head.remainingUSD)} · ` : '余 ')
+            + kilo(head.remainingPoints) + ' 点' + cap);
+        } else {
+          setText(c.left, `余 ${w.confidence === 'high' ? '' : '~'}${usd(w.remainingUSD)}`);
+        }
         if (w.etaSeconds == null) {
           setText(c.eta, '');
         } else if (w.resetAt && now + w.etaSeconds >= w.resetAt) {
@@ -937,11 +999,39 @@
       }
       setTick(c.right, w.resetAt ? countdown(w.resetAt - now) : '无固定重置');
 
+      // 换用：同一点数池按其余模型各自的扣点率折出的余额，最多三个。
+      const others = head ? models.filter((m) => m !== head).slice(0, 3) : [];
+      setHidden(c.alt, !others.length);
+      c.alts.forEach((a, k) => {
+        const m = others[k];
+        setHidden(a.el, !m);
+        if (!m) return;
+        setText(a.n, m.name);
+        setText(a.v, m.remainingUSD != null ? '~' + usd(m.remainingUSD) : '');
+        setText(a.t, m.tag || '');
+        setHidden(a.t, !m.tag);
+      });
+
       const bits = [];
-      if (w.scaledSpentUSD != null || headPoints) bits.push('账本 ' + usd(w.spentUSD));
+      if (w.scaledSpentUSD != null || headPoints || head) bits.push('账本 ' + usd(w.spentUSD));
       if (w.points) bits.push(`${kilo(w.points.used)}/${kilo(w.points.budget)} 点`);
+      // 各模型实际扣掉的点：两个以上模型有消耗才列，单一模型时与上一段重复。
+      const spenders = models ? models.filter((m) => m.usedPoints >= 1) : [];
+      if (spenders.length >= 2) {
+        spenders.slice(0, 2).forEach((m) => bits.push(`${m.name} ${kilo(m.usedPoints)}`));
+      }
+      if (w.unattributedPoints && w.points && w.unattributedPoints >= 0.02 * w.points.used) {
+        bits.push(`其他 ${kilo(w.unattributedPoints)}`);
+      }
       setText(c.sub, bits.join(' · '));
       setHidden(c.sub, !bits.length);
+      c.el.title = models ? models.map((m) => [
+        `${m.current ? '▶ ' : ''}${m.name}`,
+        m.rate != null ? `${m.rate.toFixed(1)} 点/$${m.tag ? '（' + m.tag + '）' : ''}` : '扣点率待测',
+        `本窗口已扣 ${kilo(m.usedPoints)} 点 · 账本 ${usd(m.usedUSD)}`,
+        `余 ${kilo(m.remainingPoints)} 点${m.remainingUSD != null ? ' ≈ ' + usd(m.remainingUSD) : ''}`
+          + (m.cappedBy ? `（受 ${winTitle(m.cappedBy)} 限）` : ''),
+      ].join(' · ')).join('\n') : '';
 
       const at = els.cards.children[i];
       if (at !== c.el) els.cards.insertBefore(c.el, at || null);
@@ -1001,7 +1091,7 @@
         c.tag.innerHTML = `<span class="live"><span class="pulse"></span><span class="txt"></span></span>`;
         c.pulse = c.tag.querySelector('.txt');
       }
-      setTick(c.pulse, `生成中 ${flying} 条 · 已 ${secs} 秒`);
+      setTick(c.pulse, `生成中 ${flying} 条 · 已 ${elapsed(secs)}`);
     } else {
       if (c.pulse) { c.tag.textContent = ''; c.tag.__v = undefined; c.pulse = null; }
       c.tag.style.color = 'var(--ink3)';
@@ -1020,7 +1110,7 @@
       r.m.title = row.model;
       // measured 为真时首 token 是逐请求实测值，不带 ≈；缺字段按回归行处理。
       setText(r.v, row.rate == null ? `端到端 ${row.endToEnd.toFixed(0)} tok/s`
-        : (row.ttft != null ? `首 ${row.measured ? '' : '≈'}${row.ttft.toFixed(1)}s · ` : '') + `${row.rate.toFixed(0)} tok/s`);
+        : (row.ttft != null ? `首 ${row.measured ? '' : '≈'}${row.ttft.toFixed(1)}s · ` : '') + `出字 ${row.rate.toFixed(0)} tok/s`);
       // 阈值由 Swift 侧统一把关（SpeedRow.notableDrift），这里只显示给了值的那一档。
       const drift = row.driftNotable;
       setText(r.dr, drift == null ? '' : `${drift > 0 ? '快' : '慢'}${Math.abs(drift).toFixed(0)}%`);
@@ -1042,8 +1132,15 @@
       setText(els.stamp, '');
       return;
     }
-    setHidden(els.rowFull, !d.planRateUSD && !d.unitPriceUSD && !d.unitPriceNotice);
-    if (d.planRateUSD) {
+    const rates = Array.isArray(d.rates) ? d.rates.filter((r) => r.rate != null) : [];
+    setHidden(els.rowFull, !rates.length && !d.planRateUSD && !d.unitPriceUSD && !d.unitPriceNotice);
+    els.metaFull.title = rates.length ? d.rates.map((r) => `${r.name}：${r.note}`).join('\n') : '';
+    setText(els.keyFull, rates.length ? '扣点' : '满额');
+    if (rates.length) {
+      // 各模型每美元扣点，全由本机数据求得；「估」为推算值，完整来源挂在 title 上。
+      setText(els.metaFull, rates.slice(0, 3)
+        .map((r) => `${r.name} ${Math.round(r.rate)}${r.tag || ''}`).join(' · ') + ' 点/$');
+    } else if (d.planRateUSD) {
       // 官方口径优先；账本反推并列，两者之差即上游扣点倍率与 API 价目之差
       let text = `${d.planRateNote || '官方口径'} · 额度点 × $${d.planRateUSD.toFixed(4)}`;
       if (d.unitPriceUSD) text += ` · 账本反推 $${d.unitPriceUSD.toFixed(6)}`;

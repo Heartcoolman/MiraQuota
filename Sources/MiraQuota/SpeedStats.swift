@@ -32,6 +32,18 @@ final class SpeedStats {
         let callId: String
         /// transcript 的 requestId，用于取即时 token。
         let requestId: String
+        /// 网关行的会话 UUID 与响应字节数。requestId 对不上时按会话、完成时刻与字节数
+        /// 找 transcript，见 `messageTokens`。响应字节数在 token 回填前即已落盘。
+        let session: String
+        let resBytes: Int
+    }
+
+    /// transcript 里不带 requestId 的一条助手消息：最后一行的时刻与最大 output。
+    private struct TranscriptMessage {
+        let session: String
+        let model: String
+        var at: Int
+        var out: Int
     }
 
     /// 首次读取的回溯上限。账本按月一个文件，这个量足够覆盖数天。
@@ -91,6 +103,15 @@ final class SpeedStats {
     private var diagDurations: [String: Int] = [:]
     /// transcript 给出的即时 token：requestId → output_tokens。
     private var transcriptTokens: [String: Int] = [:]
+    /// 不带 requestId 的 transcript 消息：message.id → 消息。
+    private var transcriptMessages: [String: TranscriptMessage] = [:]
+    /// 按完成时刻关联时，transcript 最后一行晚于请求结束的容差。实测最后一行落在
+    /// 结束前 0–3.6 秒（p5–p95），晚于结束的只有秒级取整误差。
+    private static let messageLag = 2
+    /// 响应字节数与 output token 之比的合理带。实测 p5–p95 为 21.5–48.7。
+    /// 只凭时刻关联，并行子代理同秒结束的请求会互相认领，实测错认 10%–24%，
+    /// 错认的 output 相对误差中位数约 0.9；加上字节比约束后主会话错认 6/281。
+    private static let bytesPerToken = 18.0...55.0
     private var analyticsCursors: [String: Int] = [:]
     private var measured: [Double] = []
     /// 网关账本各文件上次重扫时的 mtime，用于跳过未变化的文件。
@@ -178,6 +199,7 @@ final class SpeedStats {
         diagDurations = diagDurations.filter { callIds.contains($0.key) }
         let requestIds = Set(samples.map(\.requestId))
         transcriptTokens = transcriptTokens.filter { requestIds.contains($0.key) }
+        transcriptMessages = transcriptMessages.filter { $0.value.at >= cutoff }
         // mtime 闸门表按活跃文件裁剪：会话文件数以千计，常驻数周不裁会无界增长。
         let live = Set(projectFiles.recent(limit: 64, activeSince: Date(timeIntervalSinceNow: -Self.retention))
                         .map(\.url.path))
@@ -319,16 +341,38 @@ final class SpeedStats {
     /// 从 Claude Code 的 transcript 尾部取 token。transcript 是追加型、请求完成即写，
     /// 不依赖 relay 回填，是 Claude 请求的「当下」token 来源；OpenAI Codex 的 token
     /// 已随网关记录写入，不需要这条补齐路径。
-    /// 关联键：账本的 `providerCallId` 就是 transcript 的 `requestId`（实测逐条相等）。
+    /// 关联键：2026-09-23 前账本的 `providerCallId` 就是 transcript 的 `requestId`（实测逐条相等）。
+    /// 此后经云端中继的调用两侧 id 不再相通，transcript 不带 requestId，改按会话与完成时刻找，
+    /// 见 `messageTokens`。
     private func backfillFromTranscripts() {
-        let wanted = Set(samples.filter { $0.out < Self.minOutput && !$0.requestId.isEmpty }
-                                .map(\.requestId))
-        if !wanted.isEmpty {
-            scanTranscripts(for: wanted)
-        }
+        let pending = samples.filter { $0.out < Self.minOutput }
+        guard !pending.isEmpty else { return }
+        scanTranscripts(for: Set(pending.map(\.requestId).filter { !$0.isEmpty }),
+                        sessions: Set(pending.map(\.session)))
+        var claimed: Set<String> = []
         for i in samples.indices where samples[i].out < Self.minOutput {
-            if let n = transcriptTokens[samples[i].requestId], n > 0 { samples[i].out = n }
+            if let n = transcriptTokens[samples[i].requestId], n > 0 {
+                samples[i].out = n
+            } else if let (key, n) = messageTokens(for: samples[i], excluding: claimed) {
+                samples[i].out = n
+                claimed.insert(key)
+            }
         }
+    }
+
+    /// 同会话、同模型、最后一行落在 [开始, 结束 + 容差] 内、output 与响应字节数相称的消息里，
+    /// 取最后一行离结束最近的一条。同会话的并行子代理请求时段可能重叠，一条消息只认领一次。
+    private func messageTokens(for s: Sample, excluding claimed: Set<String>) -> (String, Int)? {
+        guard !s.session.isEmpty, s.resBytes > 0 else { return nil }
+        let end = s.at + s.ms / 1000
+        var best: (key: String, out: Int, gap: Int)?
+        for (key, m) in transcriptMessages where m.session == s.session && m.model == s.model
+            && m.at >= s.at && m.at <= end + Self.messageLag && !claimed.contains(key)
+            && Self.bytesPerToken.contains(Double(s.resBytes) / Double(m.out)) {
+            let gap = abs(end - m.at)
+            if best == nil || gap < best!.gap { best = (key, m.out, gap) }
+        }
+        return best.map { ($0.key, $0.out) }
     }
 
     /// 设定样本归属。启动时按落盘的状态调用一次，观测到换账号或换档位时再调用一次。
@@ -363,11 +407,15 @@ final class SpeedStats {
         }
     }
 
-    private func scanTranscripts(for wanted: Set<String>) {
+    private func scanTranscripts(for wanted: Set<String>, sessions: Set<String>) {
         projectFiles.refresh()
         // 固定取 4 个会在超过 4 个会话并行写入时把目标文件挤出扫描集，
         // 其 token 迟迟补不上；改按活跃度取，冷清时仍保底 4 个。
-        let recent = projectFiles.recent(limit: 12, activeSince: Date(timeIntervalSinceNow: -1800))
+        // 只取待补样本所属会话的文件（主会话文件名即会话 UUID）：终端里走第三方网关的会话
+        // 同样活跃，不筛会占掉名额，把 Mirasim 会话挤出扫描集。
+        let recent = projectFiles.recent(limit: 64, activeSince: Date(timeIntervalSinceNow: -1800))
+            .filter { sessions.contains($0.url.deletingPathExtension().lastPathComponent) }
+            .prefix(12)
 
         for e in recent {
             // transcript 是追加型：一行写进去 mtime 必变。未变的文件里没有新 requestId，
@@ -407,12 +455,28 @@ final class SpeedStats {
 
     private func parseTranscriptUsage(_ line: Data, wanted: Set<String>) {
         guard let root = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              let rid = root["requestId"] as? String, wanted.contains(rid),
               let message = root["message"] as? [String: Any],
               let usage = message["usage"] as? [String: Any],
               let out = Self.int(usage["output_tokens"]), out > 0 else { return }
-        // fork / resume 会复制同一条记录，取较大值即可（同一请求的值本就相同）。
-        transcriptTokens[rid] = max(transcriptTokens[rid] ?? 0, out)
+        if let rid = root["requestId"] as? String {
+            guard wanted.contains(rid) else { return }
+            // fork / resume 会复制同一条记录，取较大值即可（同一请求的值本就相同）。
+            transcriptTokens[rid] = max(transcriptTokens[rid] ?? 0, out)
+            return
+        }
+        guard let key = message["id"] as? String,
+              let session = root["sessionId"] as? String,
+              let ts = root["timestamp"] as? String, let at = fastEpochSeconds(ts) else { return }
+        // 一条消息按内容块分多行写入，靠前的行只带部分 output；取最后一行的时刻与最大值。
+        if var m = transcriptMessages[key] {
+            m.at = max(m.at, at)
+            m.out = max(m.out, out)
+            transcriptMessages[key] = m
+        } else {
+            var model = (message["model"] as? String) ?? ""
+            if let bracket = model.firstIndex(of: "[") { model = String(model[model.startIndex..<bracket]) }
+            transcriptMessages[key] = TranscriptMessage(session: session, model: model, at: at, out: out)
+        }
     }
 
     private func parseModelEvent(_ line: Data) {
@@ -511,7 +575,9 @@ final class SpeedStats {
         let id = (root["id"] as? String) ?? ts
         return Sample(id: id, at: at, out: int(root["output"]) ?? 0, ms: ms, model: model,
                       callId: id.split(separator: ":").last.map(String.init) ?? "",
-                      requestId: (root["providerCallId"] as? String) ?? "")
+                      requestId: (root["providerCallId"] as? String) ?? "",
+                      session: (root["sessionId"] as? String) ?? "",
+                      resBytes: int(root["resBytes"]) ?? 0)
     }
 
     /// 被 `parseUsage` 挡下的原因，供自检定位。只在诊断路径上调用。
@@ -795,9 +861,9 @@ final class SpeedStats {
     /// 展示名：去掉 `claude-` 前缀与快照日期后缀，族名首字母大写，版本号用点连接。
     /// `claude-opus-5` → `Opus 5`，`claude-opus-4-8` → `Opus 4.8`，
     /// `claude-haiku-4-5-20251001` → `Haiku 4.5`。
-    /// 版本段不是纯数字时（`gpt-5.6-sol`、`deepseek-v4-flash` 一类）原样保留：
-    /// 宁可显示原名，也不按猜测拼出一个错名。
-    private static func shortName(_ model: String) -> String {
+    /// GPT 变体也压成易读短名：`gpt-6-astra` → `GPT 6 Astra`，
+    /// `gpt-5.6-sol` → `GPT 5.6 Sol`。其他无法安全拆分的模型名原样保留。
+    static func shortName(_ model: String) -> String {
         guard !model.isEmpty else { return "未知" }
         var name = model
         // 可能带 provider 前缀（`anthropic/claude-opus-5`）。
@@ -809,6 +875,13 @@ final class SpeedStats {
         // 快照日期后缀，如 `-20251001`。
         if let last = parts.last, last.count == 8, last.allSatisfy(\.isNumber) { parts.removeLast() }
         guard let family = parts.first, !family.isEmpty else { return name }
+        if family.lowercased() == "gpt" {
+            let words = parts.dropFirst().map { part -> String in
+                guard let first = part.first else { return part }
+                return first.uppercased() + part.dropFirst()
+            }
+            return (["GPT"] + words).joined(separator: " ")
+        }
         let version = parts.dropFirst()
         guard !version.isEmpty, version.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) })
         else { return name }

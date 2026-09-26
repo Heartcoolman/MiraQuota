@@ -44,7 +44,7 @@ node provider-node\miraquota-provider.mjs --router-token <令牌>
 | 重置倒计时、均速游标与偏离（由窗口长度与 `reset_at` 算出） | 满额标定（需账本支出对点数增量的观测序列） |
 | 账号状态位（`suspended`/`unmetered`/`degraded`） | 速度卡（出字速度、首 token、在途「生成中」） |
 | relay 帧退路（旧版 Mirasim 无 `/v1/limits` 时取 0.1% 分辨率的百分比） | 离线推算（需落盘窗口锚点）与「已过期」之后的两级降级 |
-| 契约 A 的 feed：`quota.json` + 带令牌的 `POST /quit` | — |
+| 契约 A 的 feed：`quota.json` + 带令牌的 `POST /quit` | 分模型额度（`models`、`headModel`、`rates`、`currentModel`），控件退回单一口径 |
 | 契约 B 的注入：探针判在场、每 target 只登记一次、10/30 秒退避 | — |
 
 缺的字段一律省略而不是填零。控件对此是容忍的：满额位置显示「标定中」，主行金额显示 `—`，

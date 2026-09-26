@@ -14,6 +14,8 @@ enum Paths {
     static var ledgerState: URL { stateDir.appending(path: "ledger.json") }
     static var calibState: URL { stateDir.appending(path: "calibration.json") }
     static var calibLock: URL { stateDir.appending(path: "calibration.lock") }
+    static var rateState: URL { stateDir.appending(path: "rates.json") }
+    static var rateLock: URL { stateDir.appending(path: "rates.lock") }
     static var anchorState: URL { stateDir.appending(path: "anchor.json") }
     static var accountState: URL { stateDir.appending(path: "account.json") }
     static var feedToken: URL { stateDir.appending(path: "feed.token") }
@@ -83,6 +85,8 @@ enum Diag {
     static let noLimits = ProcessInfo.processInfo.environment["MIRAQUOTA_NO_LIMITS"] == "1"
     /// 客户端内已有控件时仍保留菜单栏图标，用于两处同时显示。
     static let statusAlways = ProcessInfo.processInfo.environment["MIRAQUOTA_STATUS_ALWAYS"] == "1"
+    /// 指定当前模型（模型名或价目 id），测试分模型显示用。
+    static let currentModel = ProcessInfo.processInfo.environment["MIRAQUOTA_CURRENT_MODEL"].flatMap { $0.isEmpty ? nil : $0 }
     /// 覆盖速度统计的窗口长度（秒），用于验证样本不足时的退化分支。
     static let speedSpan: TimeInterval? = {
         guard let raw = ProcessInfo.processInfo.environment["MIRAQUOTA_SPEED_SPAN"],

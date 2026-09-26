@@ -23,6 +23,7 @@ final class QuotaEngine: ObservableObject {
     private let pricing: Pricing
     private let ledger: CostLedger
     private let calibrator = Calibrator()
+    private let rates = PointRates()
     private let speed = SpeedStats()
     private let anchors = AnchorStore()
     private let accounts = AccountStore()
@@ -113,7 +114,8 @@ final class QuotaEngine: ObservableObject {
         ledger.refresh()
         speed.refresh()
         let now = Date()
-        lastLimits = limits.snapshot(now: now, anchorPort: relay.currentPort)
+        lastLimits = limits.snapshot(now: now, anchorPort: relay.currentPort,
+                                     accountTag: accounts.currentTag)
         if let l = lastLimits {
             recordTrail(l)
             calibrator.record(l)
@@ -122,17 +124,24 @@ final class QuotaEngine: ObservableObject {
             let groups = l.windows.compactMap(\.modelGroup)
             ledger.adoptScopedGroups(groups)
             speed.adoptScopedGroups(groups)
+            rates.refresh(limits: l, calibrator: calibrator, ledger: ledger, pricing: pricing, now: now)
         }
         let state = resolveState(now: now)
         let known = anchors.lastKnown
         let coherence = lastLimits.map { LedgerCoherence.evaluate($0, ledger: ledger, now: now) }
         let rate = coherence?.perPoint
+        let spend7d = ledger.spendByModel(from: now.addingTimeInterval(-7 * 86400), to: now, includeOpenMinute: true)
+        let current = currentModel(now: now)
 
         let windows: [WindowReport]
         switch state {
         case .exact:
             let all = lastLimits?.windows ?? []
-            windows = all.map { exact($0, siblings: all, rate: rate, snapshot: lastSnapshot, now: now) }
+            windows = all.map { w in
+                var r = exact(w, siblings: all, rate: rate, spend7d: spend7d, snapshot: lastSnapshot, now: now)
+                attachModels(&r, w, all: all, current: current, spend7d: spend7d, now: now)
+                return r
+            }
         case .live, .stale:
             let snap = lastSnapshot
             windows = (snap?.windows ?? []).map { measured($0, snapshot: snap, now: now) }
@@ -156,7 +165,9 @@ final class QuotaEngine: ObservableObject {
             speed: speed.report(now: now),
             unitPriceUSD: rate,
             unitPriceNotice: coherence.flatMap { LedgerCoherence.notice($0) },
-            accountNotice: lastLimits?.notice
+            accountNotice: lastLimits?.notice,
+            currentModel: state == .exact ? current : nil,
+            rates: state == .exact ? orderedRates(current: current, spend7d: spend7d) : []
         )
         publish(latest)
     }
@@ -272,7 +283,7 @@ final class QuotaEngine: ObservableObject {
     /// 与缓存读占比漂移，实测跨 $0.00235–0.00502。全局单价由已用点数最多的窗口反推（恒为 7d），
     /// 因而只对该窗口成立：挪到 5h 上实测偏高约 12%。故仅在标定未收敛时作兜底，且标为低置信。
     private func exact(_ w: LimitsSnapshot.Window, siblings: [LimitsSnapshot.Window], rate: Double?,
-                       snapshot: RelaySnapshot?, now: Date) -> WindowReport {
+                       spend7d: [String: Double], snapshot: RelaySnapshot?, now: Date) -> WindowReport {
         let bounds = w.quotaWindow
         let start = bounds.startAt
         let group = w.modelGroup
@@ -286,6 +297,16 @@ final class QuotaEngine: ObservableObject {
         if let estimate, estimate.confidence == .high || estimate.confidence == .medium {
             fullUSD = estimate.fullUSD
             confidence = estimate.confidence
+        } else if let group {
+            // 档位窗口的点只由该档位的模型扣，全局单价按全机混比反推，直接套用会错配
+            // （Fable 每美元扣点约为 Opus 的 2 倍）。窗口内已有档位支出时用它自己的每点美元，
+            // 否则用 `PointRates` 按本机数据求得的族内扣点率；族内全为待测则不给满额。
+            if w.used >= LedgerCoherence.minPoints, spent > 0 {
+                fullUSD = spent / w.used * w.budget
+            } else {
+                fullUSD = rates.groupRate(group, spend: spend7d).map { w.budget / $0 }
+            }
+            confidence = fullUSD == nil ? .none : .low
         } else if let rate {
             fullUSD = rate * w.budget
             confidence = .low
@@ -313,6 +334,118 @@ final class QuotaEngine: ObservableObject {
             remainingNote: split?.note,
             modelGroup: group
         )
+    }
+
+    // MARK: 分模型
+
+    /// 当前在用的模型：近 15 分钟调用最多的（并列取最近）→ 2 小时内最后一次 → 5h 内支出最多 → 花名册默认。
+    private func currentModel(now: Date) -> CurrentModel {
+        if let forced = Diag.currentModel {
+            let key = pricing.key(for: forced)
+            return CurrentModel(key: key, name: Pricing.displayName(key), source: "override", at: nil)
+        }
+        let t = Int(now.timeIntervalSince1970)
+        let calls = ledger.recentCalls
+        let active = calls.filter { t - $0.at <= 900 }
+        if !active.isEmpty {
+            var count: [String: (n: Int, last: Int)] = [:]
+            for c in active {
+                let old = count[c.key] ?? (0, 0)
+                count[c.key] = (old.n + 1, max(old.last, c.at))
+            }
+            let top = count.max { ($0.value.n, $0.value.last) < ($1.value.n, $1.value.last) }!
+            return CurrentModel(key: top.key, name: Pricing.displayName(top.key), source: "active",
+                                at: Date(timeIntervalSince1970: Double(top.value.last)))
+        }
+        if let last = calls.max(by: { $0.at < $1.at }) {
+            return CurrentModel(key: last.key, name: Pricing.displayName(last.key), source: "latest",
+                                at: Date(timeIntervalSince1970: Double(last.at)))
+        }
+        if let five = lastLimits?.window("5h"),
+           let top = ledger.spendByModel(from: five.quotaWindow.startAt ?? now, to: now, includeOpenMinute: true)
+            .max(by: { $0.value < $1.value }) {
+            return CurrentModel(key: top.key, name: Pricing.displayName(top.key), source: "window", at: nil)
+        }
+        let key = rates.anchorKey
+        return CurrentModel(key: key, name: Pricing.displayName(key), source: "default", at: nil)
+    }
+
+    /// 模型是否受该窗口约束：通用窗口约束全部模型，档位窗口只约束名字含组名的模型。
+    private static func applies(_ w: LimitsSnapshot.Window, _ key: String) -> Bool {
+        guard w.modelScoped, let group = w.modelGroup else { return true }
+        return key.contains(group)
+    }
+
+    /// 本窗口的分模型额度。点数是共用真值：已用点数按格拆到模型，余点取所有约束该模型的窗口里最小的，
+    /// 美元一律为「点数 ÷ 该模型每美元扣点」。只列近 7 天用过的与当前模型。
+    private func attachModels(_ r: inout WindowReport, _ w: LimitsSnapshot.Window, all: [LimitsSnapshot.Window],
+                              current: CurrentModel, spend7d: [String: Double], now: Date) {
+        guard let start = w.quotaWindow.startAt else { return }
+        let inWindow = ledger.spendByModel(from: start, to: now, includeOpenMinute: true)
+        let listed = Set(spend7d.filter { $0.value >= 0.01 }.keys).union(inWindow.keys).union([current.key])
+            .filter { Self.applies(w, $0) }
+        guard !listed.isEmpty else { return }
+        let fallbackRate = rates.anchorRate
+
+        // 已用点数的归属：窗口在分族树里时逐格取上游点数，否则整窗一格。
+        var usedPoints: [String: Double] = [:]
+        var unattributed = 0.0
+        let used = { (label: String) in all.first { $0.label == label }?.used }
+        var cells: [(points: Double, members: [String])] = []
+        if let tree = rates.tree, tree.nodes[w.label] != nil, tree.resetAt == w.resetAt {
+            var stack = [w.label]
+            while let label = stack.popLast() {
+                stack += tree.nodes[label]?.children ?? []
+                guard let pts = tree.cellPoints(label, used: used) else { continue }
+                cells.append((pts, inWindow.keys.filter { tree.cell(of: $0) == label }))
+            }
+        } else {
+            cells = [(w.used, Array(inWindow.keys))]
+        }
+        for cell in cells where cell.points > 0 {
+            let weights = cell.members.map { k in (k, (inWindow[k] ?? 0) * (rates.rate(k).pointsPerUSD ?? fallbackRate ?? 0)) }
+            let sum = weights.reduce(0) { $0 + $1.1 }
+            guard sum > 0 else { unattributed += cell.points; continue }
+            let allKnown = cell.members.allSatisfy { rates.rate($0).pointsPerUSD != nil }
+            // 各成员扣点率都已知而折算点数明显不足时，差额是账本看不到的消耗，单列不摊。
+            let scale = allKnown && sum < 0.95 * cell.points ? 1 : cell.points / sum
+            if scale == 1 { unattributed += cell.points - sum }
+            for (k, v) in weights { usedPoints[k, default: 0] += v * scale }
+        }
+
+        let binding = all.filter { $0.resetAt.timeIntervalSince(w.resetAt) >= -60 }
+        let quotas: [ModelQuota] = listed.map { key in
+            let rate = rates.rate(key)
+            let own = (label: w.label, left: max(0, w.budget - w.used))
+            // 约束窗口的余点只有明显少于本窗口（差出预算的 0.1% 以上）才算受它限，
+            // 7d 与 7d_claude 预算相同、只差零星非 Claude 用量时不标。
+            let cap = binding.filter { Self.applies($0, key) }
+                .map { (label: $0.label, left: max(0, $0.budget - $0.used)) }
+                .filter { $0.left < own.left - max(1, 0.001 * w.budget) }
+                .min { $0.left < $1.left } ?? own
+            let r = rate.pointsPerUSD
+            return ModelQuota(key: key, name: rate.name, current: key == current.key, rate: r, source: rate.source,
+                              usedPoints: usedPoints[key] ?? 0, usedUSD: inWindow[key] ?? 0,
+                              usedAsUSD: r.map { w.used / $0 }, fullUSD: r.map { w.budget / $0 },
+                              remainingPoints: cap.left, remainingUSD: r.map { cap.left / $0 },
+                              cappedBy: cap.label == w.label ? nil : cap.label)
+        }.sorted { a, b in
+            if a.current != b.current { return a.current }
+            return (spend7d[a.key] ?? 0) > (spend7d[b.key] ?? 0)
+        }
+        r.models = quotas
+        r.headModel = quotas.first { $0.current }?.key ?? quotas.first?.key
+        r.unattributedPoints = unattributed > 0.5 ? unattributed : nil
+    }
+
+    /// 各模型扣点率，当前模型在前，其次按近 7 天支出，没有支出的按名字。
+    private func orderedRates(current: CurrentModel, spend7d: [String: Double]) -> [ModelRate] {
+        rates.table.values.sorted { a, b in
+            if (a.key == current.key) != (b.key == current.key) { return a.key == current.key }
+            let sa = spend7d[a.key] ?? 0, sb = spend7d[b.key] ?? 0
+            if sa != sb { return sa > sb }
+            return a.key < b.key
+        }
     }
 
     /// relay 实测：百分比直接采用，满额由标定反推。
@@ -453,6 +586,11 @@ final class QuotaEngine: ObservableObject {
             print("单价     \(notice)")
         }
         if let notice = r.accountNotice { print("账号     \(notice)") }
+        if let c = r.currentModel { print("当前模型 \(c.name)（\(c.source)）") }
+        for rate in r.rates {
+            let v = rate.pointsPerUSD.map { String(format: " %.1f 点/$", $0) } ?? ""
+            print("扣点率   \(rate.name)\(v)\(rate.tag.map { " " + $0 } ?? "") · \(rate.note)")
+        }
         print("")
         for w in r.windows {
             let full = w.fullUSD.map { String(format: "$%.0f", $0) } ?? "标定中"
@@ -476,6 +614,16 @@ final class QuotaEngine: ObservableObject {
                 print(String(format: "      余 $%.0f%@", rem, eta))
                 if let note = w.remainingNote { print("      余额分段 \(note)") }
             }
+            for m in w.models ?? [] {
+                let rate = m.rate.map { String(format: "%.1f 点/$", $0) } ?? ""
+                let left = m.remainingUSD.map { String(format: "余 $%.0f", $0) } ?? "余 -"
+                let cap = m.cappedBy.map { "（受 \($0) 限）" } ?? ""
+                print(String(format: "      %@%@ %@%@ · 已用 %.0f 点 / $%.2f · %@ · 余 %.0f 点%@",
+                             m.current ? "▶" : " ", m.name as NSString, rate as NSString,
+                             m.tag.map { " " + $0 } ?? "", m.usedPoints, m.usedUSD, left as NSString,
+                             m.remainingPoints, cap as NSString))
+            }
+            if let u = w.unattributedPoints { print(String(format: "       未归属 %.0f 点", u)) }
             if let reset = w.resetAt {
                 print("      重置 \(Self.stamp.string(from: reset))")
             } else {

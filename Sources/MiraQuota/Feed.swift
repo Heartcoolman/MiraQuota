@@ -257,7 +257,36 @@ final class Feed {
         if let price = r.unitPriceUSD { root["unitPriceUSD"] = price }
         if let notice = r.unitPriceNotice { root["unitPriceNotice"] = notice }
         if let speed = r.speed { root["speed"] = self.speed(speed) }
+        if let c = r.currentModel {
+            var cur: [String: Any] = ["key": c.key, "name": c.name, "source": c.source]
+            if let at = c.at { cur["at"] = at.timeIntervalSince1970 }
+            root["currentModel"] = cur
+        }
+        if !r.rates.isEmpty { root["rates"] = r.rates.map(rate) }
         return root
+    }
+
+    private static func rate(_ r: ModelRate) -> [String: Any] {
+        var out: [String: Any] = ["key": r.key, "name": r.name, "source": r.source.rawValue, "note": r.note,
+                                  "usd": r.evidenceUSD, "points": r.evidencePoints, "bins": r.bins]
+        if let v = r.pointsPerUSD { out["rate"] = v }
+        if let t = r.tag { out["tag"] = t }
+        if let at = r.measuredAt { out["measuredAt"] = at.timeIntervalSince1970 }
+        if let e = r.relErr { out["relErr"] = e }
+        return out
+    }
+
+    private static func model(_ m: ModelQuota) -> [String: Any] {
+        var out: [String: Any] = ["key": m.key, "name": m.name, "current": m.current, "source": m.source.rawValue,
+                                  "usedPoints": m.usedPoints, "usedUSD": m.usedUSD,
+                                  "remainingPoints": m.remainingPoints]
+        if let v = m.rate { out["rate"] = v }
+        if let t = m.tag { out["tag"] = t }
+        if let v = m.usedAsUSD { out["usedAsUSD"] = v }
+        if let v = m.fullUSD { out["fullUSD"] = v }
+        if let v = m.remainingUSD { out["remainingUSD"] = v }
+        if let v = m.cappedBy { out["cappedBy"] = v }
+        return out
     }
 
     private static func window(_ w: WindowReport) -> [String: Any] {
@@ -280,6 +309,10 @@ final class Feed {
         if let scaled = w.scaledSpentUSD { out["scaledSpentUSD"] = scaled }
         // 档位窗口的 spentUSD 只含同档位模型的支出，控件据此说明它与全机支出不同口径。
         if let group = w.modelGroup { out["modelGroup"] = group }
+        // 分模型额度。缺省（非精确通道或旧版引擎）时控件退回单一美元口径。
+        if let models = w.models { out["models"] = models.map(model) }
+        if let head = w.headModel { out["headModel"] = head }
+        if let u = w.unattributedPoints { out["unattributedPoints"] = u }
         return out
     }
 

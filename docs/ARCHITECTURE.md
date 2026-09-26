@@ -43,13 +43,15 @@ macOS provider 的网关账本同时覆盖 Claude 与 OpenAI Codex 请求。
 | `detail` | string? | 当前级别的补充说明，控件作横幅显示 |
 | `capturedAt` | number | 采集时刻，unix 秒。控件据此判断数据是否发霉 |
 | `mode` / `host` / `relayStatus` | string | 线路、relay 主机、relay 状态 |
-| `pricing` | string | 价目表来源：`models.dev cache` 或 `builtin` |
+| `pricing` | string | 价目表来源，如 `Mirasim 花名册 2026-09-24.v6 + models.dev`；花名册缺失时为 `models.dev` 或 `内置表` |
 | `buckets` | number | 账本的分钟桶数量，仅作自检 |
 | `unitPriceUSD` | number? | 额度点单价，美元/点。由账本支出 ÷ 已用点数反推，取不到即缺省。账本按 API 价目折算，Fable 用量占比高时低于官方口径 |
 | `unitPriceNotice` | string? | 兜底单价停用的原因。逐窗口反推的每点美元离散超 4 倍即判账本与点数不自洽，此时 `unitPriceUSD` 缺省，界面在页脚显示本串 |
 | `accountNotice` | string? | 账号状态提示（`suspended` / `unmetered` / `degraded`） |
 | `windows` | array | 每个额度窗口一项，见下 |
 | `speed` | object? | 速度卡数据，见下 |
+| `currentModel` | object? | 当前在用的模型 `{key, name, source, at?}`。`source`：`active`（近 15 分钟调用最多）/ `latest`（2 小时内最后一次）/ `window`（5h 内支出最多）/ `default`（花名册默认）/ `override` |
+| `rates` | array? | 各模型每美元扣点 `{key, name, rate?, source, tag?, note, usd, points, bins, measuredAt?, relErr?}`。`source`：`measured` / `lastMeasured` / `estimated`（`tag` 为「估」）/ `unknown`（无 `rate`，`tag` 为「待测」）。倍率全由本机数据求得，`note` 写明方法、时段与证据 |
 
 `windows[]`：
 
@@ -67,6 +69,9 @@ macOS provider 的网关账本同时覆盖 Claude 与 OpenAI Codex 请求。
 | `etaSeconds` | number? | 按近 1 小时点增速外推的打满秒数。父窗口分两段：子窗口到顶后只按其余模型的增速；其余增速为零时给出大于重置剩余时长的值，界面据此显示「到重置不满」 |
 | `confidence` | string | 标定置信度 |
 | `inferred` | bool | 真值表示百分比来自推算，界面须加 `≈` |
+| `models` | array? | 分模型额度，只在 exact 级有值。各模型共用同一点数池，美元按该模型每美元扣点折算：`{key, name, current, rate?, source, tag?, usedPoints, usedUSD, usedAsUSD?, fullUSD?, remainingPoints, remainingUSD?, cappedBy?}`。**缺省时界面退回上面的单一美元口径** |
+| `headModel` | string? | 卡头按哪个模型折算美元，是 `models[].key` 之一 |
+| `unattributedPoints` | number? | 有点数、账本却无对应支出的部分（另一台设备、未定价模型等） |
 
 `speed`：`recentCount`、`sampleTotal`、`inflight`（在途起始时刻，unix 秒，非空即「生成中」）、
 `measuredTurnTTFB`（`{median, count}`），以及 `rows[]`：`model`、`samples`、`latestAt`、
@@ -108,7 +113,7 @@ provider 侧要做到的六条，缺一条都有确定的故障形态：
 |---|---|---|
 | CDP 探测与注入 | `URLSession` + `URLSessionWebSocketTask` | 任何 HTTP/WS 客户端。Node 22+ 自带 `WebSocket`，一个 `.mjs` 即可跑通 |
 | feed HTTP 服务 | `Network.framework` 的 `NWListener` | 任意 HTTP server，**必须只绑 127.0.0.1** |
-| Mirasim 路由端口发现 | `ps` 解析 `server.cjs serve --port N`，再 `lsof -p <pid>` 枚举该进程的回环监听口 | Windows 用 `Get-CimInstance Win32_Process` 取命令行 + `netstat -ano` 按 pid 过滤；Linux 用 `/proc/<pid>/cmdline` + `ss -tlnp` |
+| Mirasim 路由端口发现 | `ps` 解析 `server.cjs serve --port N`，再 `lsof -p <pid>` 枚举该进程的回环监听口；0.0.322 起会话路由端口由 `mirasim claude` 进程持有，改从会话进程环境的 `ANTHROPIC_BASE_URL` 取，并以响应的 `subject` 与帧的 `login.userId` 对账 | Windows 用 `Get-CimInstance Win32_Process` 取命令行 + `netstat -ano` 按 pid 过滤；Linux 用 `/proc/<pid>/cmdline` + `ss -tlnp` |
 | 账本与诊断文件 | `~/.claude/projects/*/*.jsonl`、`~/.mirasim/{insights,diag,analytics}` | 路径同为用户主目录下同名目录，格式与平台无关 |
 | 状态落盘 | `~/.miraquota/`（账本游标、标定样本、窗口锚点、feed 令牌、单实例锁） | 同构即可；单实例锁要带约 3 秒重试，重启时新旧实例会短暂重叠 |
 | 常驻自启 | LaunchAgent（`LimitLoadToSessionType=Aqua`，`KeepAlive.SuccessfulExit=false`） | Windows 计划任务（登录触发）或 systemd user unit |

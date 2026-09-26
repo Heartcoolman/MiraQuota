@@ -3,10 +3,14 @@ import Foundation
 /// 成本账本：增量扫描 Claude Code 的 transcript 与 Mirasim 的网关账本，
 /// 把每次调用的 token 折算成 API 等价美元，按分钟聚合。
 ///
-/// 两个来源都不完备，故取并集。Anthropic 的 Claude 请求用 transcript 与网关账本
-/// 的 request id 跨源去重（transcript 的 `requestId` 即网关账本的
-/// `providerCallId`）；OpenAI Codex 请求没有对应的本地 transcript，直接以网关账本
-/// 的请求 id 计入。
+/// 两个来源都不完备，故取并集。Anthropic 的 Claude 请求跨源去重先认 id
+/// （2026-09-23 前 transcript 的 `requestId` 即网关账本的 `providerCallId`），
+/// id 不相通时按内容对齐，见 `fingerprint`；OpenAI Codex 请求没有对应的本地
+/// transcript，直接以网关账本的请求 id 计入。
+///
+/// transcript 只计经 Mirasim 的调用：`~/.claude/projects` 也收着不经 Mirasim 的
+/// Claude Code 会话（实测终端经 HTTPS_PROXY 走第三方网关的会话），它们不耗 Mirasim 额度。
+/// 判据见 `viaMirasim`。
 ///
 /// - transcript 的 token 完整、可回溯全部历史，但只记录写回会话的助手消息。
 ///   标题生成、被丢弃的响应、文件已被清理的子代理会话都不在其中，本机实测
@@ -15,8 +19,9 @@ import Foundation
 ///   （30 分钟分块回归 R² 0.85/0.99，仅 transcript 为 0.80/0.82），
 ///   但 token 由 relay 回填、只重扫尾部窗口，早于窗口的记录取不回。
 final class CostLedger {
-    /// 只保留该时长内的数据，覆盖 7d 窗口并留出余量。
-    static let retention: TimeInterval = 8 * 86400
+    /// 只保留该时长内的数据：覆盖 7d 窗口，也覆盖百分比样本的 14 天保留期，
+    /// 供 `PointRates` 对久未使用的模型做历史回归（参照模型的支出须同在账本里）。
+    static let retention: TimeInterval = 15 * 86400
 
     /// 会话文件的枚举缓存。速度统计另持一份，两者的字节游标互不相干。
     private let files = ProjectFiles()
@@ -34,8 +39,12 @@ final class CostLedger {
 
     /// 账本的折算口径版本。桶与账目只存金额、不留 token，价目口径一变，已落账的金额无法
     /// 原地改算，只能清掉游标与账目从磁盘重建（transcript 可回溯全部历史，网关账本首扫整读）。
-    /// 1：API 价目；2、3：曾按上游扣点倍率折算（Fable 5.1 × 2，已回退）；4：回到 API 价目。
-    static let pricingVersion = 4
+    /// 1：API 价目；2、3：曾按上游扣点倍率折算（Fable 5.1 × 2，已回退）；4：回到 API 价目；
+    /// 5：Opus 5.5 单列价目，Claude 调用跨源按内容对齐，不计不经 Mirasim 的会话；
+    /// 6：是否经 Mirasim 改按调用判（见 `viaMirasim`）；7：Kimi K3 入价目，OpenAI 模型按 272K 长上下文分档计价；
+    /// 8：价目以 Mirasim 花名册为准、只计经中继的网关行、按模型分桶。此后价目内容变化由 `pricingSignature` 触发重建；
+    /// 9：保留期由 8 天延到 15 天，重建以回补更早的记录；10：网关行按完成时刻入桶。
+    static let pricingVersion = 10
 
     private struct Persisted: Codable {
         /// 落盘时的折算口径，缺省即版本 1。理由同 `booked`，必须是 Optional。
@@ -52,6 +61,9 @@ final class CostLedger {
         /// 必须是 Optional：合成 Codable 只对 Optional 走 decodeIfPresent，
         /// 旧 ledger.json 缺该键时非可选会让整个状态解码失败被静默清空。
         var booked: [String: Double]? = nil
+        /// 次级键 → 账目键。次级键为内容指纹（见 `fingerprint`）或另一侧的请求 id，
+        /// 同一次调用由哪一侧先入账，另一侧都经它落到同一个账目键上。必须是 Optional，理由同 `booked`。
+        var alias: [String: String]? = nil
         /// 旧版按账本行 id 单独存的网关账目，只在 `load` 里并进 `seen` 与 `booked`。
         var gateway: [String: GatewayEntry]? = nil
         /// 模型档位分桶，键为 `组名|unix 分钟`。`/v1/limits` 的 modelScoped 窗口
@@ -61,6 +73,11 @@ final class CostLedger {
         /// 组名 → 该组开始分桶的 unix 分钟。桶只存金额、不留模型，启用之前的支出
         /// 无从回溯，窗口起点早于此值时该组的支出偏低，由 `scopedComplete` 判定。
         var scopedSince: [String: Int]? = nil
+        /// 按模型分桶：模型键（`Pricing.key`）→ unix 分钟 → 美元。扣点率要把点数增量
+        /// 按模型拆开，分组桶粒度不够。必须是 Optional，理由同 `booked`。
+        var models: [String: [String: Double]]? = nil
+        /// 落盘时的价目指纹（`Pricing.signature`）。花名册调价后已落账的金额不再同口径，不符即重建。
+        var pricingSignature: String? = nil
     }
 
     private var state = Persisted()
@@ -74,6 +91,19 @@ final class CostLedger {
     private var countedLedger: Set<String> = []
     /// 本进程是否已整读过网关账本。
     private var fullGatewayScanDone = false
+    /// 网关账本在保留期内出现过的会话与 Anthropic 请求 id（含待回填的行）。
+    /// 每进程首轮整读网关账本时建齐，transcript 据此判定调用是否经 Mirasim。
+    private var gatewaySessions: Set<String> = []
+    private var gatewayCallIds: Set<String> = []
+    /// 近 2 小时经中继完成的调用（开始时刻、模型键），供判定当前在用的模型。只在内存里，
+    /// 首轮整读网关账本即可建齐。token 由中继事后回填，登记不能等 token。
+    private(set) var recentCalls: [(at: Int, key: String)] = []
+    static let recentSpan = 7200
+    private var recentIds: Set<String> = []
+    /// 经中继但查不到价的调用（分钟、模型键）。这些调用照样扣点却不进账本，
+    /// 扣点率拟合要避开它们所在的时段。
+    private(set) var unpricedCalls: [(minute: Int, key: String)] = []
+    private(set) var unpricedModels: [String: Int] = [:]
 
     /// 分钟桶的有序前缀和。标定一次会调用 `spent` 成百上千次，
     /// 逐次全表扫描并解析字符串键，开销随「样本数 × 桶数」成平方级增长。
@@ -81,6 +111,8 @@ final class CostLedger {
     private var index: (minutes: [Int], prefix: [Double])?
     /// 各模型档位组的前缀和，按需构建。
     private var scopedIndex: [String: (minutes: [Int], prefix: [Double])] = [:]
+    /// 各模型的前缀和，按需构建。
+    private var modelIndex: [String: (minutes: [Int], prefix: [Double])] = [:]
     /// 当前需要单独分桶的模型档位组，小写。取自 `/v1/limits` 的 modelScoped 窗口名。
     private var scopedGroups: [String] = []
 
@@ -94,7 +126,10 @@ final class CostLedger {
         // 没有状态文件时 load 直接返回，这里兜住：账目表为 nil 时下面所有
         // `state.booked?[key] = …` 都会静默丢弃，两侧的补差额随之失效。
         if state.booked == nil { state.booked = [:] }
+        if state.alias == nil { state.alias = [:] }
+        if state.models == nil { state.models = [:] }
         if state.pricingVersion == nil { state.pricingVersion = Self.pricingVersion }
+        if state.pricingSignature == nil { state.pricingSignature = pricing.signature }
     }
 
     // MARK: 持久化
@@ -104,7 +139,9 @@ final class CostLedger {
               let p = try? JSONDecoder().decode(Persisted.self, from: data) else { return }
         state = p
         if state.booked == nil { state.booked = [:] }
-        if (state.pricingVersion ?? 1) != Self.pricingVersion { rebuild() }
+        if (state.pricingVersion ?? 1) != Self.pricingVersion || state.pricingSignature != pricing.signature {
+            rebuild()
+        }
         // 已声明过的档位组从盘面恢复：`refresh` 先于 `adoptScopedGroups` 运行，进程启动后
         // 第一轮解析的记录若不知道分组就永远进不了档位桶（游标随即落盘）。常驻实例与
         // --once/--doctor 每次启动都漏一段，实测 7d_fable 的档位支出因此低四成。
@@ -124,6 +161,9 @@ final class CostLedger {
         var fresh = Persisted()
         fresh.pricingVersion = Self.pricingVersion
         fresh.booked = [:]
+        fresh.alias = [:]
+        fresh.models = [:]
+        fresh.pricingSignature = pricing.signature
         fresh.scoped = [:]
         fresh.scopedSince = (state.scopedSince ?? [:]).mapValues { _ in since }
         state = fresh
@@ -142,8 +182,9 @@ final class CostLedger {
     func refresh(now: Date = Date()) -> Bool {
         let cutoff = Int(now.addingTimeInterval(-Self.retention).timeIntervalSince1970)
         var changed = false
-        changed = scanTranscripts(cutoff: cutoff) || changed
+        // 网关在前：transcript 按 `viaMirasim` 筛调用，首轮须先建齐网关侧的会话与 id。
         changed = scanGatewayLedger(cutoff: cutoff) || changed
+        changed = scanTranscripts(cutoff: cutoff) || changed
         prune(cutoff: cutoff)
         if changed { save() }
         return changed
@@ -279,26 +320,33 @@ final class CostLedger {
               let message = root["message"] as? [String: Any],
               let usage = message["usage"] as? [String: Any] else { return }
 
+        let session = root["sessionId"] as? String
+        guard viaMirasim(requestId: root["requestId"] as? String, session: session) else { return }
+
         let minute = epoch / 60
-        let requestId = (root["requestId"] as? String) ?? (message["id"] as? String)
+        let input = int(usage["input_tokens"])
+        let cacheRead = int(usage["cache_read_input_tokens"])
+        let cacheWrite = int(usage["cache_creation_input_tokens"])
+        let fp = Self.fingerprint(session: session, input: input, cacheRead: cacheRead, cacheWrite: cacheWrite)
+        let sourceId = (root["requestId"] as? String) ?? (message["id"] as? String)
+        let requestId = sourceId.map { canonical($0, fp) }
         // 已计过且知道金额：一次响应会写成多行（思考、工具调用、正文各一行），
         // 靠前的行只带部分 output，取最大值补差额，否则整段输出按残值定格。
         if let rid = requestId, state.booked?[rid] == nil, state.seen[rid] != nil { return }
 
         let model = (message["model"] as? String) ?? ""
-        guard let usd = pricing.cost(model: model,
-                                     input: int(usage["input_tokens"]),
+        guard let usd = pricing.cost(model: model, input: input,
                                      output: int(usage["output_tokens"]),
-                                     cacheRead: int(usage["cache_read_input_tokens"]),
-                                     cacheWrite: int(usage["cache_creation_input_tokens"])) else {
+                                     cacheRead: cacheRead, cacheWrite: cacheWrite, at: epoch) else {
             unpricedRecords += 1
             return
         }
-        guard let rid = requestId else {
+        guard let sourceId, let rid = requestId else {
             add(minute: minute, usd: usd, model: model)
             transcriptRecords += 1
             return
         }
+        link(sourceId, fp, to: rid)
         if let prior = state.booked?[rid] {
             guard usd > prior else { return }
             add(minute: state.seen[rid] ?? minute, usd: usd - prior, model: model)
@@ -311,20 +359,79 @@ final class CostLedger {
         transcriptRecords += 1
     }
 
+    /// transcript 里的一次调用是否经 Mirasim。按调用而非按会话判：同一会话可以中途换线路，
+    /// 实测有终端会话只有 2 次经 Mirasim、其余 2127 次走第三方网关。
+    /// - 带 `requestId`：2026-09-23 前 Mirasim 调用的 `req_…` 均出现在网关的 `providerCallId` 里，
+    ///   之后 Mirasim 调用一律不带；终端会话的 `req_…` 实测 4.8 万行无一在网关里。
+    /// - 不带：按会话判。mirabridge 转发的调用记在被借用槽位的会话下，其 transcript 因此不计，
+    ///   由网关行计入。
+    /// 网关账本整段缺失（旧版 Mirasim 不写）时不筛，否则账本归零。
+    private func viaMirasim(requestId: String?, session: String?) -> Bool {
+        if gatewaySessions.isEmpty { return true }
+        if let requestId { return gatewayCallIds.contains(requestId) }
+        return session.map(gatewaySessions.contains) ?? false
+    }
+
+    /// 跨源对齐用的内容指纹。2026-09-23 起经云端中继的调用两侧 id 不再相通：网关的
+    /// `providerCallId` 改为中继自己的 id，transcript 不再带 `requestId`，按 id 去重全部落空，
+    /// 同一次调用两侧各计一遍。改以同会话内输入侧三项 token 认定同一次调用：同一请求的多行
+    /// transcript 只有 output 不同，这三项恒等；实测抽样 40/40 与网关行逐条对上。
+    /// 子代理 transcript 的 `sessionId` 取父会话，与网关行一致。
+    private static func fingerprint(session: String?, input: Int, cacheRead: Int, cacheWrite: Int) -> String? {
+        guard let session, input + cacheRead + cacheWrite > 0 else { return nil }
+        return "fp|\(session)|\(input)|\(cacheRead)|\(cacheWrite)"
+    }
+
+    /// 解析账目键：本键已入账即用本键，否则先认别名，再认内容指纹。
+    /// 本键优先，fork 复制进新会话的消息（指纹因会话不同而变）仍按原 id 去重。
+    private func canonical(_ key: String, _ fp: String?) -> String {
+        if state.seen[key] != nil { return key }
+        return state.alias?[key] ?? fp.flatMap { state.alias?[$0] } ?? key
+    }
+
+    private func link(_ key: String, _ fp: String?, to canonical: String) {
+        if key != canonical { state.alias?[key] = canonical }
+        if let fp, state.alias?[fp] == nil { state.alias?[fp] = canonical }
+    }
+
     /// 返回是否有新的美元入桶（含回填差额）。
     private func parseGatewayLine(_ line: Data, cutoff: Int) -> Bool {
         guard let root = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               let ts = root["ts"] as? String,
               let epoch = fastEpochSeconds(ts), epoch >= cutoff,
-              let provider = root["provider"] as? String,
-              provider == "anthropic" || provider == "openai" || provider.hasPrefix("openai-") else { return false }
-        guard let id = root["id"] as? String else { return false }
+              let id = root["id"] as? String else { return false }
+        // 只计经中继的行：直连上游（`leg: direct`，实测有经第三方网关的 GPT-6、直连 api.anthropic.com
+        // 与 api.deepseek.com 的行）不耗 Mirasim 额度。缺 `viaRelay` 的旧行按上游主机判。
+        guard (root["viaRelay"] as? Bool)
+                ?? ((root["upstreamHost"] as? String)?.contains("mirasim") ?? false) else { return false }
+        let provider = (root["provider"] as? String) ?? ""
+        let session = root["sessionId"] as? String
+        if let session { gatewaySessions.insert(session) }
 
-        // 账目键优先取 providerCallId：它与 transcript 的 requestId 同值，
-        // 同一次调用两侧谁先落账都记在同一个键上，另一侧据此补差额而非重复计入。
+        // 行的 `ts` 是请求开始时刻，上游在请求完成时扣点：入桶取完成时刻，
+        // 长请求（实测 GPT-6、Fable 常达数分钟）的支出才与点数增量落在同一时段。
+        let done = epoch + int(root["durationMs"]) / 1000
+        let model = (root["model"] as? String) ?? ""
+        if !model.isEmpty, (root["status"] as? Int) == 200,
+           done >= Int(Date().timeIntervalSince1970) - Self.recentSpan, recentIds.insert(id).inserted {
+            recentCalls.append((done, pricing.key(for: model)))
+        }
+        let input = int(root["input"])
+        let output = int(root["output"])
+        let cacheRead = int(root["cacheRead"])
+        let cacheWrite = int(root["cacheWrite"])
+        let hasTokens = input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0
+        let fp = provider == "anthropic"
+            ? Self.fingerprint(session: session, input: input, cacheRead: cacheRead, cacheWrite: cacheWrite) : nil
+
+        // 账目键优先取 providerCallId：2026-09-23 前它与 transcript 的 requestId 同值，
+        // 此后两侧 id 不相通，由内容指纹对齐（见 `fingerprint`）。同一次调用两侧谁先落账
+        // 都记在同一个键上，另一侧据此补差额而非重复计入。
         // 旧状态按账本行 id 认领过的行仍按 id 走，否则升级后会再计一遍。
         let providerCallId = root["providerCallId"] as? String
-        let key = state.seen[id] != nil ? id : (providerCallId ?? id)
+        if provider == "anthropic", let providerCallId { gatewayCallIds.insert(providerCallId) }
+        let sourceId = state.seen[id] != nil ? id : (providerCallId ?? id)
+        let key = canonical(sourceId, fp)
         let prior = state.booked?[key]
         if prior == nil {
             // 有 seen 无金额：旧版按字节游标入过账，无从补差，跳过防止重复计入。
@@ -337,12 +444,6 @@ final class CostLedger {
                agent == "claude" || agent == "codex" { return false }
         }
 
-        let model = (root["model"] as? String) ?? ""
-        let input = int(root["input"])
-        let output = int(root["output"])
-        let cacheRead = int(root["cacheRead"])
-        let cacheWrite = int(root["cacheWrite"])
-        let hasTokens = input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0
         // OpenAI 的早期 `openai-chat` 记录可能没有模型和 token（只代表一次
         // 请求尝试，不是可计费调用），跳过且不把它们误报成未定价。
         guard !model.isEmpty else {
@@ -350,20 +451,26 @@ final class CostLedger {
             return false
         }
         let usd = pricing.cost(model: model, input: input, output: output,
-                               cacheRead: cacheRead, cacheWrite: cacheWrite)
+                               cacheRead: cacheRead, cacheWrite: cacheWrite, at: epoch)
         // cost 对零 token 的已知模型返回 0.0 而非 nil——token 未回填的行
         // 此刻既不入账也不记已见，等回填后重读，这正是旧游标口径丢钱的病根。
         guard let usd, usd > 0 else {
-            if hasTokens, countedUnpriced.insert(id).inserted { unpricedRecords += 1 }
+            if usd == nil, hasTokens, countedUnpriced.insert(id).inserted {
+                unpricedRecords += 1
+                let key = pricing.key(for: model)
+                unpricedModels[key, default: 0] += 1
+                unpricedCalls.append((done / 60, key))
+            }
             return false
         }
+        link(sourceId, fp, to: key)
         if let prior {
             guard usd > prior else { return false }
             // 回填把金额补大了：差额记回首见的分钟，桶归属不漂移。
-            add(minute: state.seen[key] ?? epoch / 60, usd: usd - prior, model: model)
+            add(minute: state.seen[key] ?? done / 60, usd: usd - prior, model: model)
             state.booked?[key] = usd
         } else {
-            let minute = epoch / 60
+            let minute = done / 60
             state.seen[key] = minute
             state.booked?[key] = usd
             add(minute: minute, usd: usd, model: model)
@@ -384,7 +491,11 @@ final class CostLedger {
         let key = String(minute)
         state.buckets[key, default: 0] += usd
         index = nil
-        guard !scopedGroups.isEmpty, !model.isEmpty else { return }
+        guard !model.isEmpty else { return }
+        let modelKey = pricing.key(for: model)
+        state.models?[modelKey, default: [:]][key, default: 0] += usd
+        modelIndex[modelKey] = nil
+        guard !scopedGroups.isEmpty else { return }
         let lower = model.lowercased()
         for group in scopedGroups where lower.contains(group) {
             state.scoped?[group + "|" + key, default: 0] += usd
@@ -396,7 +507,9 @@ final class CostLedger {
     /// （`7d_fable` → `fable`），模型名含该子串即归入该组。
     /// 新组从声明时刻起累积：桶只存金额，此前的支出无从追认。
     func adoptScopedGroups(_ groups: [String]) {
-        let normalized = groups.map { $0.lowercased() }.filter { !$0.isEmpty }.sorted()
+        // 合并而非替换：从盘面恢复的组（见 `load`）不因某一帧暂缺该窗口而被丢掉，
+        // 否则重建后第一轮解析的记录进不了档位桶。
+        let normalized = Set(scopedGroups).union(groups.map { $0.lowercased() }.filter { !$0.isEmpty }).sorted()
         guard normalized != scopedGroups else { return }
         scopedGroups = normalized
         if state.scoped == nil { state.scoped = [:] }
@@ -429,9 +542,17 @@ final class CostLedger {
             }
             scopedIndex.removeAll()
         }
+        if let models = state.models {
+            state.models = models.mapValues { $0.filter { (Int($0.key) ?? 0) >= minCutoff } }.filter { !$0.value.isEmpty }
+            modelIndex.removeAll()
+        }
+        let recentFloor = Int(Date().timeIntervalSince1970) - Self.recentSpan
+        recentCalls.removeAll { $0.at < recentFloor }
+        unpricedCalls.removeAll { $0.minute < minCutoff }
         state.seen = state.seen.filter { $0.value >= minCutoff }
         // 金额账目与 seen 同生共死：键一致，靠 seen 的分钟判龄。
         state.booked = state.booked.map { $0.filter { state.seen[$0.key] != nil } }
+        state.alias = state.alias.map { $0.filter { state.seen[$0.value] != nil } }
         // 游标只对 transcript 有意义（网关账本走上面的重扫）；
         // 已删除文件的条目会随 save 永远写回，不清理则 ledger.json 无界增长。
         state.cursors = state.cursors.filter { key, _ in
@@ -463,6 +584,37 @@ final class CostLedger {
         let hi = lowerBound(table.minutes,
                             Int(to.timeIntervalSince1970) / 60 + (includeOpenMinute ? 1 : 0))
         return table.prefix[hi] - table.prefix[lo]
+    }
+
+    /// 半开区间 [from, to) 内某一模型（`Pricing.key`）的等价支出。
+    func spent(from: Date, to: Date, includeOpenMinute: Bool = false, model: String) -> Double {
+        if modelIndex[model] == nil {
+            modelIndex[model] = Self.prefixSums((state.models?[model] ?? [:]).compactMap { key, value in
+                Int(key).map { ($0, value) }
+            })
+        }
+        guard let table = modelIndex[model], !table.minutes.isEmpty else { return 0 }
+        let lo = lowerBound(table.minutes, Int(from.timeIntervalSince1970) / 60)
+        let hi = lowerBound(table.minutes,
+                            Int(to.timeIntervalSince1970) / 60 + (includeOpenMinute ? 1 : 0))
+        return table.prefix[hi] - table.prefix[lo]
+    }
+
+    /// 某一模型在保留期内首末有支出的分钟，无支出为 nil。
+    func modelSpan(_ model: String) -> (first: Date, last: Date)? {
+        let minutes = (state.models?[model] ?? [:]).keys.compactMap { Int($0) }
+        guard let lo = minutes.min(), let hi = minutes.max() else { return nil }
+        return (Date(timeIntervalSince1970: Double(lo * 60)), Date(timeIntervalSince1970: Double(hi * 60 + 60)))
+    }
+
+    /// 半开区间内各模型的等价支出，零支出的模型不列。
+    func spendByModel(from: Date, to: Date, includeOpenMinute: Bool = false) -> [String: Double] {
+        var out: [String: Double] = [:]
+        for key in (state.models ?? [:]).keys {
+            let v = spent(from: from, to: to, includeOpenMinute: includeOpenMinute, model: key)
+            if v > 0 { out[key] = v }
+        }
+        return out
     }
 
     private func buildIndex() {

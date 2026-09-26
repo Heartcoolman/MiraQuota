@@ -53,7 +53,9 @@ struct PanelView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 11)
-        .frame(width: 340)
+        // 宽度由速度卡最宽的一行定：模型名 78 + 指标 132 + 偏离标 44 + 时刻 46，
+        // 加列间距约 316pt，再加面板与卡片的左右内边距 44pt。窄于此值这一行会互相压住。
+        .frame(width: 365)
         // NSPopover 默认材质只做模糊、不做亮度校正，暗背景透进来会压暗整个面板。
         // 系统菜单的 .menu 材质自带向主题底色的亮度提升（浅色外观推白、深色推黑），
         // 深色壁纸下仍是浅灰模糊底，磨砂感与可读性同时保住；纯色垫层则会盖掉模糊。
@@ -141,23 +143,22 @@ struct PanelView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 4) {
             Divider()
-            if let price = engine.report.unitPriceUSD {
+            if let rates = Formatting.rateLine(engine.report.rates) {
+                metaRow("扣点", rates)
+            } else if let price = engine.report.unitPriceUSD {
                 metaRow("满额", String(format: "回归标定优先 · 兜底 额度点 × $%.6f", price))
             } else if let notice = engine.report.unitPriceNotice {
                 metaRow("满额", notice)
             } else if !engine.report.windows.isEmpty {
                 metaRow("标定", calibrationLine)
             }
-            metaRow("账本", "\(engine.report.bucketCount) 分钟桶 · 新增 \(engine.report.newRecords) 条 · \(engine.pricingSource)")
+            // 与客户端控件同为三行键值，时刻与按钮另起一行。
+            metaRow("账本", "\(engine.report.bucketCount) 分钟桶 · \(engine.pricingSource)")
+            metaRow("线路", "\(modeLabel) \(engine.report.host) · \(engine.report.relayStatus)")
             HStack(spacing: 5) {
                 Text(Self.clock.string(from: engine.report.capturedAt))
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: 10).monospacedDigit())
                     .foregroundStyle(.tertiary)
-                Text("\(modeLabel) \(engine.report.host) · \(engine.report.relayStatus)")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
                 Spacer(minLength: 4)
                 Button("窗口") {
                     NotificationCenter.default.post(name: AppDelegate.openWindowRequest, object: nil)
@@ -172,20 +173,23 @@ struct PanelView: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
             }
-            .padding(.top, 1)
+            .padding(.top, 4)
         }
     }
 
     private func metaRow(_ key: String, _ value: String) -> some View {
         HStack(alignment: .top, spacing: 6) {
             Text(key)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.tertiary)
-                .frame(width: 25, alignment: .leading)
-            Text(value)
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 30, alignment: .leading)
+            // 单行截尾，全文挂在悬浮提示上：页脚折行会把整个弹层撑高一截。
+            Text(value)
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(value)
             Spacer(minLength: 0)
         }
     }
@@ -235,46 +239,72 @@ struct WindowCard: View {
     let measured: Bool
     let primary: Bool
 
+    /// 字号与层级对齐客户端控件（`widget/miraquota-widget.js` 的 `.crow` / `.foot` / `.alt` / `.sub`）：
+    /// 金额 16/14pt、满额浅色小字，余额行只给打满时刻挂徽标，重置写作「重置 X」。
+    /// 此前金额 21/19pt、整行橙底，与控件并排看时显得拥挤（09-26 用户对照截图）。
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text(Formatting.windowTitle(window.label))
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 68, alignment: .leading)
+                // 模型标签放在标题下方：挤进卡头会把金额与满额压到折行（09-26 截图 `$1,29` / `8`）。
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(Formatting.windowTitle(window.label))
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    if let head = window.head { modelChip(head) }
+                }
+                .frame(width: 74, alignment: .leading)
                 Text(headline.text)
-                    .font(.system(size: primary ? 21 : 19, weight: .semibold, design: .rounded).monospacedDigit())
+                    .font(.system(size: primary ? 16.5 : 14, weight: .bold).monospacedDigit())
+                    .lineLimit(1)
+                    .fixedSize()
                     // 数字过渡只挂在按报告刷新的字段上；倒计时那类秒级走动的不挂，否则每秒抖一次。
                     .contentTransition(.numericText(value: headline.value))
                     .animation(.smooth(duration: 0.35), value: headline.value)
                 Text(quotaSuffix)
-                    .font(.system(size: 12, weight: .medium, design: .rounded).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .fixedSize()
                 Spacer(minLength: 4)
                 percentBadge
             }
 
             ProgressBar(percent: window.usedPercent, marker: window.pacePercent, tone: tone)
+                .padding(.top, 7)
 
-            HStack(spacing: 6) {
+            HStack(spacing: 4) {
                 Text(leftText)
-                    .font(.system(size: 10.5, weight: etaSoon ? .medium : .regular))
-                    .foregroundStyle(etaSoon ? Color.warnTone : Color.secondary)
-                    .padding(.horizontal, etaSoon ? 5 : 0)
-                    .padding(.vertical, etaSoon ? 1.5 : 0)
-                    // 纯色文字盖在磨砂材质上，色相稍暗时几乎读不出来；打满临近时才加底色垫一层，够不上阈值时不占地方。
-                    .background { if etaSoon { Capsule().fill(Color.warnTone.opacity(0.14)) } }
+                    .foregroundStyle(.secondary)
+                if let eta = etaPart {
+                    Text(eta.text)
+                        .foregroundStyle(eta.soon ? Color.warnTone : Color.secondary)
+                        .padding(.horizontal, eta.soon ? 4 : 0)
+                        // 纯色文字盖在磨砂材质上，色相稍暗时几乎读不出来；只有打满早于重置时才垫一层底色。
+                        .background { if eta.soon { RoundedRectangle(cornerRadius: 4).fill(Color.warnTone.opacity(0.14)) } }
+                }
                 Spacer(minLength: 4)
                 Text(resetText)
-                    // 时钟形式的倒计时用等宽稳住宽度；「5 天后重置」这类走等宽会拉出空隙。
-                    .font(.system(size: 10.5, design: resetText.contains(":") ? .monospaced : .default))
                     .foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 10).monospacedDigit())
+            .lineLimit(1)
+            .padding(.top, 6)
+
+            if let alt = altLine {
+                // 放不下时折到第二行，不截断：被截掉的正是要比较的余额。
+                alt
+                    .font(.system(size: 9.5).monospacedDigit())
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 4)
             }
 
             if let sub = subText {
                 Text(sub)
                     .font(.system(size: 9.5).monospacedDigit())
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .padding(.top, 3)
             }
         }
         .cardSkin(emphasis: primary)
@@ -296,7 +326,26 @@ struct WindowCard: View {
         }
     }
 
+    /// 卡头模型标签：当前在用的模型着强调色，推算值与待测值挂「估」「待测」。
+    private func modelChip(_ m: ModelQuota) -> some View {
+        (Text(m.name) + (m.tag.map { Text(" " + $0).foregroundColor(.warnTone) } ?? Text("")))
+            .font(.system(size: 9.5, weight: .semibold))
+            .foregroundStyle(m.current ? Color.accentColor : Color.secondary)
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1.5)
+            .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill((m.current ? Color.accentColor : Color.secondary).opacity(0.13)))
+            .truncationMode(.tail)
+            .frame(maxWidth: 78, alignment: .leading)
+    }
+
     private var headlineKind: Headline {
+        // 分模型：美元按卡头模型的每美元扣点折算；该模型扣点率待测时主行改点数。
+        if let head = window.head {
+            if let v = head.usedAsUSD { return .scaled(v) }
+            if let p = window.points { return .points(p.used) }
+        }
         if let scaled = window.scaledSpentUSD { return .scaled(scaled) }
         if window.fullUSD == nil, let p = window.points { return .points(p.used) }
         return .ledger(window.spentUSD)
@@ -304,17 +353,21 @@ struct WindowCard: View {
 
     private var percentBadge: some View {
         Text((window.inferred ? "≈" : "") + String(format: "%.1f%%", window.usedPercent))
-            .font(.system(size: 11, weight: .semibold, design: .rounded).monospacedDigit())
+            .font(.system(size: 11, weight: .semibold).monospacedDigit())
             .foregroundStyle(tone)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1.5)
-            .background(Capsule().fill(tone.opacity(0.13)))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(tone.opacity(0.13)))
             .contentTransition(.numericText(value: window.usedPercent))
             .animation(.smooth(duration: 0.35), value: window.usedPercent)
     }
 
     /// 满额部分。未收敛的标定值标 `~`，避免把推断值读成确定值。
     private var quotaSuffix: String {
+        if let head = window.head {
+            if let full = head.fullUSD { return "/ ~\(Formatting.usd(full))" }
+            if let p = window.points { return "/ \(Formatting.kilo(p.budget)) 点" }
+        }
         guard let full = window.fullUSD else { return "/ 标定中" }
         let prefix = window.confidence == .high ? "" : "~"
         return "/ \(prefix)\(Formatting.usd(full))"
@@ -328,15 +381,15 @@ struct WindowCard: View {
 
     /// 剩余额度与按点增速外推的打满时刻；两者缺失时退回均速偏离。
     private var leftText: String {
-        if let rem = window.remainingUSD {
-            let mark = window.confidence == .high ? "" : "~"
-            var text = "余 \(mark)\(Formatting.usd(rem))"
-            if let eta = window.etaSeconds {
-                if let reset = window.resetAt, now.addingTimeInterval(eta) >= reset {
-                    text += " · 到重置不满"
-                } else {
-                    text += " · ≈\(Formatting.duration(eta))后打满"
-                }
+        if window.head != nil || window.remainingUSD != nil {
+            var text: String
+            if let head = window.head {
+                text = (head.remainingUSD.map { "余 ~\(Formatting.usd($0)) · " } ?? "余 ")
+                    + "\(Formatting.kilo(head.remainingPoints)) 点"
+                if let cap = head.cappedBy { text += " · 受\(Formatting.windowTitle(cap))限" }
+            } else {
+                let mark = window.confidence == .high ? "" : "~"
+                text = "余 \(mark)\(Formatting.usd(window.remainingUSD ?? 0))"
             }
             return text
         }
@@ -347,11 +400,11 @@ struct WindowCard: View {
         return String(format: "均速 %.0f%% · %@ %.1f%%", pace, word, abs(delta))
     }
 
-    /// 打满早于重置时才把这一行标成橙色；否则它只是个平静的余额。
-    private var etaSoon: Bool {
-        guard let eta = window.etaSeconds, window.remainingUSD != nil else { return false }
-        guard let reset = window.resetAt else { return true }
-        return now.addingTimeInterval(eta) < reset
+    /// 按点增速外推的打满时刻。打满早于重置才挂橙色徽标；否则只是一句平静的「到重置不满」。
+    private var etaPart: (text: String, soon: Bool)? {
+        guard let eta = window.etaSeconds, window.head != nil || window.remainingUSD != nil else { return nil }
+        if let reset = window.resetAt, now.addingTimeInterval(eta) >= reset { return ("· 到重置不满", false) }
+        return ("≈\(Formatting.duration(eta))后打满", true)
     }
 
     private var subText: String? {
@@ -363,19 +416,54 @@ struct WindowCard: View {
         if let p = window.points {
             bits.append("\(Formatting.kilo(p.used))/\(Formatting.kilo(p.budget)) 点")
         }
+        // 各模型实际扣掉的点：两个以上模型有消耗才列。
+        let spenders = (window.models ?? []).filter { $0.usedPoints >= 1 }
+        if spenders.count >= 2 {
+            bits += spenders.prefix(2).map { "\($0.name) \(Formatting.kilo($0.usedPoints))" }
+        }
+        if let u = window.unattributedPoints, let p = window.points, u >= 0.02 * p.used {
+            bits.append("其他 \(Formatting.kilo(u))")
+        }
         return bits.isEmpty ? nil : bits.joined(separator: " · ")
+    }
+
+    /// 换用：同一点数池按其余模型各自的扣点率折出的余额，最多三个。「估」「待测」用橙色小字。
+    /// 项内用不换行空格：折行只落在各项之间，不把模型名与它的余额拆到两行。
+    private var altLine: Text? {
+        guard let head = window.head else { return nil }
+        let others = Array((window.models ?? []).filter { $0.key != head.key }.prefix(3))
+        guard !others.isEmpty else { return nil }
+        let nb = { (s: String) in s.replacingOccurrences(of: " ", with: "\u{00A0}") }
+        var line = Text("换用 ").foregroundColor(.secondary.opacity(0.7))
+        for (i, m) in others.enumerated() {
+            if i > 0 { line = line + Text(" · ").foregroundColor(.secondary.opacity(0.6)) }
+            line = line + Text(nb(m.name + (m.remainingUSD.map { " ~\(Formatting.usd($0))" } ?? ""))).foregroundColor(.secondary)
+            if let tag = m.tag {
+                line = line + Text("\u{00A0}" + tag).font(.system(size: 8.5, weight: .semibold)).foregroundColor(.warnTone)
+            }
+        }
+        return line
     }
 
     private var resetText: String {
         guard let reset = window.resetAt else { return "无固定重置" }
         let remaining = reset.timeIntervalSince(now)
         guard remaining > 0 else { return "即将重置" }
-        let text = Formatting.countdown(remaining)
-        // 数字与汉字之间留空格，汉字之间不留。
-        return text + (text.last?.isNumber == true ? " " : "") + "后重置"
+        return "重置 " + Formatting.countdown(remaining)
     }
 
     private var hint: String {
+        if let models = window.models, !models.isEmpty {
+            var lines = ["各模型共用同一点数池，美元按各自每美元扣点折算"]
+            for m in models {
+                let rate = m.rate.map { String(format: "%.1f 点/$", $0) + (m.tag.map { "（\($0)）" } ?? "") } ?? "扣点率待测"
+                let left = m.remainingUSD.map { " ≈ \(Formatting.usd($0))" } ?? ""
+                lines.append("\(m.current ? "▶ " : "")\(m.name) · \(rate) · 本窗口已扣 \(Formatting.kilo(m.usedPoints)) 点"
+                             + " · 账本 \(Formatting.usd(m.usedUSD)) · 余 \(Formatting.kilo(m.remainingPoints)) 点\(left)")
+            }
+            if let reset = window.resetAt { lines.append("重置于 " + PanelView.clock.string(from: reset)) }
+            return lines.joined(separator: "\n")
+        }
         var lines = ["主行为按点数口径折算的已用额度（满额 × 百分比）"]
         lines.append("本机 API 等价支出为 \(Formatting.usd(window.spentUSD))，两者口径不同")
         if let p = window.points {
@@ -426,7 +514,7 @@ struct SpeedCard: View {
                     // 在途请求来自诊断事件流，请求发出瞬间即可见；出字速度仍要等落账。
                     HStack(spacing: 4) {
                         Circle().fill(Color.okTone).frame(width: 5, height: 5)
-                        Text("生成中 \(report.inflightSince.count) 条 · 已 \(Int(now.timeIntervalSince(oldest))) 秒")
+                        Text("生成中 \(report.inflightSince.count) 条 · 已 \(Formatting.elapsed(now.timeIntervalSince(oldest)))")
                             .font(.system(size: 9.5, weight: .medium).monospacedDigit())
                     }
                     .foregroundStyle(Color.okTone)
@@ -454,7 +542,7 @@ struct SpeedCard: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
-                            .frame(width: 60, alignment: .leading)
+                            .frame(width: 78, alignment: .leading)
                         Text(Self.detail(row))
                             .font(.system(size: 10.5).monospacedDigit())
                             .lineLimit(1)
@@ -493,17 +581,17 @@ struct SpeedCard: View {
             return String(format: "端到端 %.0f tok/s", row.endToEnd)
         }
         // 实测行的首 token 是逐请求测量值的中位数，不带 ≈；回归行才是截距估计。
-        // 标签取 `首`（不写成 `首 token`）：340pt 面板宽下，带偏离标的行会因这 6 个字符折行。
+        // 标签取 `首`（不写成 `首 token`）：365pt 面板宽下，带偏离标的行会因这 6 个字符折行。
+        // 有首 token 才能扣除等待时间；否则上面的分支明确显示端到端速度。
         let head = row.ttft.map { String(format: row.measured ? "首 %.1fs · " : "首 ≈%.1fs · ", $0) } ?? ""
-        return head + String(format: "%.0f tok/s", rate)
+        return head + String(format: "出字 %.0f tok/s", rate)
     }
 
     private var hint: String {
         var lines = [
-            "出字速度取最近 \(report.recentCount) 次请求，按 token 加权，并对显示值做一阶平滑",
-            "实测行（首 token 不带 ≈）：Claude Code 的 OTel trace 逐请求上报首 token 与时长；OpenAI Codex 使用网关回归",
-            "回归行（首 token 带 ≈）：账本只有总时长，首 token 取 48 小时样本的回归截距",
-            "常态基准为同路径样本的出字速度；端到端为输出量除以总时长，含首字等待",
+            "出字速度：扣除首 token 等待后的输出速率；有首 token 时才显示",
+            "端到端速度：输出量 ÷ 请求总时长，包含排队、首 token 和流式输出",
+            "Claude Code 的 OTel trace 有逐请求首 token；GPT/Codex 网关没有，因此显示端到端速度",
         ]
         if let m = report.measuredTurnTTFB {
             lines.append(String(format: "Mirasim 实测整轮首字节 中位 %.1fs（%d 次）· 口径为整轮而非单次请求，仅作量级对照", m.median, m.count))
@@ -565,11 +653,21 @@ enum Formatting {
         return String(format: "%.0f", v)
     }
 
+    /// 页脚「满额」行：各模型每美元扣点，取前三个有值的。全由本机数据求得，「估」为推算值。
+    static func rateLine(_ rates: [ModelRate]) -> String? {
+        let known = rates.filter { $0.pointsPerUSD != nil }.prefix(3)
+        guard !known.isEmpty else { return nil }
+        return known.map { r in
+            String(format: "%@ %.0f", r.name, r.pointsPerUSD!) + (r.tag ?? "")
+        }.joined(separator: " · ") + " 点/$"
+    }
+
     static func windowTitle(_ label: String) -> String {
         switch label.lowercased() {
         case "5h": return "5 小时"
         case "7d": return "7 天"
         case "7d_fable": return "7 天 · Fable"
+        case "7d_claude": return "7 天 · Claude"
         default: return label
         }
     }
@@ -588,6 +686,12 @@ enum Formatting {
         if seconds < 5400 { return String(format: "%.0f 分钟", seconds / 60) }
         if seconds < 86400 { return String(format: "%.1f 小时", seconds / 3600) }
         return String(format: "%.1f 天", seconds / 86400)
+    }
+
+    /// 在途时长。过 90 秒后纯秒数要心算，改成分秒。
+    static func elapsed(_ seconds: TimeInterval) -> String {
+        let s = Int(max(0, seconds))
+        return s < 90 ? "\(s) 秒" : "\(s / 60) 分 \(s % 60) 秒"
     }
 
     /// 龄期的口语化表述，用于说明数据有多旧。
