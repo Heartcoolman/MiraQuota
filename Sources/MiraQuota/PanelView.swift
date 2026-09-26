@@ -143,14 +143,16 @@ struct PanelView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 4) {
             Divider()
-            if let rates = Formatting.rateLine(engine.report.rates) {
-                metaRow("扣点", rates)
-            } else if let price = engine.report.unitPriceUSD {
+            // 满额（每点单价）与扣点（各模型每 $1 扣多少点）并列：前者是一个单价，后者逐模型列。
+            if let price = engine.report.unitPriceUSD {
                 metaRow("满额", String(format: "回归标定优先 · 兜底 额度点 × $%.6f", price))
             } else if let notice = engine.report.unitPriceNotice {
                 metaRow("满额", notice)
             } else if !engine.report.windows.isEmpty {
                 metaRow("标定", calibrationLine)
+            }
+            if let rates = Formatting.rateLine(engine.report.rates) {
+                metaRow("扣点", rates)
             }
             // 与客户端控件同为三行键值，时刻与按钮另起一行。
             metaRow("账本", "\(engine.report.bucketCount) 分钟桶 · \(engine.pricingSource)")

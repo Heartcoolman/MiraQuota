@@ -30,6 +30,8 @@
  * 副行追加分模型已扣点数；页脚「满额」改列各模型扣点率。缺 `models` 时走原口径。
  * v23 模型标签移到标题下方：挤在卡头时金额列被压窄；「换用」行放不下折到第二行而不截断；页脚改为「扣点」一行。
  * v24 新增「按用法」一行：近期混用多个模型时，按各模型支出比例折出的余额；扣点率新增「实测中」标签。
+ * v28 页脚「满额」恢复为每点单价（回归标定优先 · 兜底 额度点 × $x），「扣点」另起一行逐模型列每 $1 扣多少点；
+ *     v25–v27 曾改为逐模型的每点单价、再改为单个单价，均已撤回。版本号须高于页面上可能残留的 v27。
  * v15–v17 加标题栏吸附：宿主标题栏右侧本就排着自己的控件，控件贴右上角会压在上面。
  * 拖到标题栏空位附近即吸附（吸附位取「不与宿主控件重叠的最右一段空位」），
  * 之后随宿主布局变化（窗口缩放、标签增减）一起走。拖离即解除。
@@ -38,7 +40,7 @@
  */
 (() => {
   'use strict';
-  const VERSION = 24;
+  const VERSION = 28;
   if (window.__miraquotaWidget) {
     // 接管而非让位：持久注册的旧脚本每次导航都先执行、先占坑，
     // 让位式守卫会把后注册的新版本永远挡在门外。
@@ -428,7 +430,8 @@
       <div id="speedbox"></div>
       <div class="hair"></div>
       <div class="meta">
-        <div class="mrow" id="rowFull"><span class="k" id="keyFull">满额</span><span class="mv" id="metaFull"></span></div>
+        <div class="mrow" id="rowFull"><span class="k">满额</span><span class="mv" id="metaFull"></span></div>
+        <div class="mrow" id="rowRate" hidden><span class="k">扣点</span><span class="mv" id="metaRate"></span></div>
         <div class="mrow" id="rowLedger"><span class="k">账本</span><span class="mv" id="metaLedger"></span></div>
         <div class="mrow" id="rowLine"><span class="k">线路</span><span class="mv" id="metaLine"></span></div>
       </div>
@@ -444,7 +447,8 @@
     sep: $('sep'), seg2: $('seg2'), lb2: $('lb2'), v2: $('v2'),
     chip: $('chip'), cdot: $('cdot'), clabel: $('clabel'),
     banners: $('banners'), cards: $('cards'), speedbox: $('speedbox'),
-    rowFull: $('rowFull'), metaFull: $('metaFull'), keyFull: $('keyFull'),
+    rowFull: $('rowFull'), metaFull: $('metaFull'),
+    rowRate: $('rowRate'), metaRate: $('metaRate'),
     rowLedger: $('rowLedger'), metaLedger: $('metaLedger'),
     rowLine: $('rowLine'), metaLine: $('metaLine'),
     stamp: $('stamp'), quit: $('quit'),
@@ -1148,20 +1152,22 @@
   function drawFooter(d) {
     if (!d) {
       setHidden(els.rowFull, true);
+      setHidden(els.rowRate, true);
       setHidden(els.rowLedger, true);
       setHidden(els.rowLine, true);
       setText(els.stamp, '');
       return;
     }
+    // 扣点：各模型每 $1 扣多少点，全由本机数据求得；「估」为推算值，完整来源挂在 title 上。
     const rates = Array.isArray(d.rates) ? d.rates.filter((r) => r.rate != null) : [];
-    setHidden(els.rowFull, !rates.length && !d.planRateUSD && !d.unitPriceUSD && !d.unitPriceNotice);
-    els.metaFull.title = rates.length ? d.rates.map((r) => `${r.name}：${r.note}`).join('\n') : '';
-    setText(els.keyFull, rates.length ? '扣点' : '满额');
+    setHidden(els.rowRate, !rates.length);
     if (rates.length) {
-      // 各模型每美元扣点，全由本机数据求得；「估」为推算值，完整来源挂在 title 上。
-      setText(els.metaFull, rates.slice(0, 3)
+      setText(els.metaRate, rates.slice(0, 3)
         .map((r) => `${r.name} ${Math.round(r.rate)}${r.tag || ''}`).join(' · ') + ' 点/$');
-    } else if (d.planRateUSD) {
+      els.metaRate.title = d.rates.map((r) => `${r.name}：${r.note}`).join('\n');
+    }
+    setHidden(els.rowFull, !d.planRateUSD && !d.unitPriceUSD && !d.unitPriceNotice);
+    if (d.planRateUSD) {
       // 官方口径优先；账本反推并列，两者之差即上游扣点倍率与 API 价目之差
       let text = `${d.planRateNote || '官方口径'} · 额度点 × $${d.planRateUSD.toFixed(4)}`;
       if (d.unitPriceUSD) text += ` · 账本反推 $${d.unitPriceUSD.toFixed(6)}`;

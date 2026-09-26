@@ -249,12 +249,13 @@ private struct MetaGrid: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("口径").font(.system(size: 11.5, weight: .medium)).foregroundStyle(.secondary)
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
-                if let rates = Formatting.rateLine(report.rates) {
-                    row("扣点", rates)
-                } else if let unit = report.unitPriceUSD {
+                if let unit = report.unitPriceUSD {
                     row("满额", "回归标定优先 · 兜底 额度点 × $" + String(format: "%.6f", unit))
                 } else if let notice = report.unitPriceNotice {
                     row("满额", notice)
+                }
+                if let rates = Formatting.rateLine(report.rates) {
+                    row("扣点", rates)
                 }
                 row("账本", "\(report.bucketCount) 分钟桶 · 本进程新增 \(report.newRecords) 条 · \(pricing)")
                 row("线路", [report.mode, report.host, report.relayStatus]
